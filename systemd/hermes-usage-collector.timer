@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Hermes usage data every 5 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5m
+Unit=hermes-usage-collector.service
+
+[Install]
+WantedBy=default.target

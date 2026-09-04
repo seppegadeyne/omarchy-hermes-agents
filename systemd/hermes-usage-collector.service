@@ -1,0 +1,9 @@
+[Unit]
+Description=Hermes usage collector for Omarchy agents panel
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hermes-usage-collector
+StandardOutput=journal
+StandardError=journal
