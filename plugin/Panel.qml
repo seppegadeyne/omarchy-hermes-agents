@@ -8,7 +8,10 @@ import qs.Ui
 Panel {
   id: root
   moduleName: "omarchy.agents"
-  ipcTarget: "omarchy.agents"
+  // Own IPC target: the stock omarchy.agents panel registers first and
+  // would otherwise swallow calls (refresh went "ok" to the stock handler,
+  // which knows nothing about hermes-usage-collector).
+  ipcTarget: "seppe.agents"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground

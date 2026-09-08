@@ -659,10 +659,12 @@ def _store_cached_limits(cache, provider_id, entry):
         pass  # cache is best-effort; never fail the collector over it
 
 
-def fetch_limits_resilient(provider_id, fetcher, auth):
+def fetch_limits_resilient(provider_id, fetcher, auth, allow_retry=True):
     """Run a limits fetcher with one transient retry and stale-limit caching.
 
     Returns (limits, tier_label, status_text, auth_help).
+    Set allow_retry=False when the caller already has its own retry loop
+    (the panel's retryAdvised 30s retry calls us with --limits-only).
     """
     limits, tier_label, status_text, auth_help = fetcher(auth)
 
@@ -679,8 +681,9 @@ def fetch_limits_resilient(provider_id, fetcher, auth):
         return limits, tier_label, status_text, auth_help
 
     # Fetch failed: retry once for transient-looking errors (post-boot DNS
-    # warmup typically resolves within a few seconds).
-    if _is_transient_fetch_error(status_text, auth_help):
+    # warmup typically resolves within a few seconds). Skipped when the
+    # caller runs its own retry loop (panel --limits-only mode).
+    if allow_retry and _is_transient_fetch_error(status_text, auth_help):
         time.sleep(5)
         limits, tier_label, status_text, auth_help = fetcher(auth)
         if limits or not status_text:
@@ -712,6 +715,16 @@ def fetch_limits_resilient(provider_id, fetcher, auth):
 
 
 # ── Token usage from DB ──────────────────────────────────────────────────────
+
+
+def _retry_advised(status_text, auth_help):
+    """True when the panel should rerun this provider's limits fetch sooner.
+
+    Only transient (network) failures advise a retry — the 30s panel retry
+    then gives the fetch a second chance well before the next timer run.
+    Auth errors advise nothing: a retry can't fix them.
+    """
+    return bool(status_text) and _is_transient_fetch_error(status_text, auth_help)
 
 
 def collect_provider(conn, meta, auth):
@@ -816,6 +829,7 @@ def collect_provider(conn, meta, auth):
         "tierLabel": tier_label,
         "usageStatusText": status_text,
         "authHelpText": auth_help,
+        "retryAdvised": _retry_advised(status_text, auth_help),
         "limits": limits,
         "todayPrompts": today_prompts,
         "todaySessions": len(today_sessions),
@@ -834,7 +848,74 @@ def collect_provider(conn, meta, auth):
     return record
 
 
+def _refresh_limits_only(meta, auth):
+    """Re-fetch only the limits for one provider and patch them into the
+    existing record on disk. Token stats stay untouched — this is what the
+    panel's --limits-only mode (open-panel refresh and retryAdvised retry)
+    calls us with.
+    """
+    out_path = USAGE_DIR / f"{meta['id']}.json"
+    try:
+        record = json.loads(out_path.read_text())
+        if not isinstance(record, dict):
+            raise ValueError("not an object")
+    except Exception:
+        # No usable record yet: fall back to a full collect.
+        record = None
+    if record is None:
+        print(f"limits-only: no usable {out_path.name}, skipping")
+        return
+
+    # Panel-triggered limits-only run: the panel's own 30s retryAdvised
+    # loop is the retry, so no in-process sleep here.
+    limits, tier_label, status_text, auth_help = fetch_limits_resilient(
+        meta["id"], LIMIT_FETCHERS[meta["limits_fn"]], auth,
+        allow_retry=False,
+    )
+    record["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    record["tierLabel"] = tier_label or record.get("tierLabel", "")
+    record["usageStatusText"] = status_text
+    record["authHelpText"] = auth_help
+    record["retryAdvised"] = _retry_advised(status_text, auth_help)
+    record["limits"] = limits
+
+    tmp_path = USAGE_DIR / f".{meta['id']}.tmp"
+    tmp_path.write_text(json.dumps(record, indent=2) + "\n")
+    tmp_path.replace(out_path)
+    print(
+        f"Patch {out_path.name} "
+        f"(limits-only, {len(limits)} limits)"
+    )
+
+
+def _parse_args(argv):
+    """Parse the omarchy-agent-usage-update call convention:
+    [--force] [--limits-only] [--except <id>]... [provider-id]...
+    Returns (limits_only, only_ids, excluded_ids).
+    """
+    limits_only = False
+    only_ids = set()
+    excluded = set()
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--force":
+            pass  # full run is the default here
+        elif arg == "--limits-only":
+            limits_only = True
+        elif arg == "--except":
+            i += 1
+            if i < len(argv):
+                excluded.add(argv[i])
+        else:
+            only_ids.add(arg)
+        i += 1
+    return limits_only, only_ids, excluded
+
+
 def main():
+    limits_only, only_ids, excluded = _parse_args(sys.argv[1:])
+
     if not STATE_DB.exists():
         print(f"hermes-usage-collector: {STATE_DB} not found", file=sys.stderr)
         return 1
@@ -845,6 +926,13 @@ def main():
     conn = sqlite3.connect(str(STATE_DB))
     try:
         for meta in PROVIDERS:
+            if only_ids and meta["id"] not in only_ids:
+                continue
+            if meta["id"] in excluded:
+                continue
+            if limits_only:
+                _refresh_limits_only(meta, auth)
+                continue
             record = collect_provider(conn, meta, auth)
             out_path = USAGE_DIR / f"{meta['id']}.json"
             tmp_path = USAGE_DIR / f".{meta['id']}.tmp"

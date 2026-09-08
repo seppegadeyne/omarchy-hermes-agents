@@ -72,10 +72,14 @@ Two deliberate safety rules learned the hard way (documented inline):
   are served from a cache (max 2h old, stored *outside* the usage directory
   — the panel renders every `*.json` in there as a tab) with the status
   suffixed "— showing cached limits". Auth errors (invalid key, relogin)
-  are never retried and never masked by cache. The panel's own
-  `retryAdvised` mechanism can't help here: it reruns
-  `omarchy-agent-usage-update`, which only reaches the stock built-in
-  collectors, not this one.
+  are never retried and never masked by cache. On top of that the collector
+  writes `retryAdvised: true` for transient failures, and this clone runs
+  `hermes-usage-collector` alongside `omarchy-agent-usage-update` on every
+  panel-triggered refresh — so the panel's built-in 30s retry now also
+  covers the custom providers (stock only reruns the built-in collectors).
+  The clone registers its IPC under its own target (`seppe.agents`), so
+  `omarchy-shell seppe.agents refresh` reaches the clone, not the stock
+  panel that loads first.
 
 ## Install
 

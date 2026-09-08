@@ -93,6 +93,20 @@ limits, tier, status, help_ = huc.fetch_limits_resilient("zai", flaky_fetcher, {
 check(not limits, "stale cache (>2h) served, must not be")
 check("cached" not in status, f"stale cache status: {status!r}")
 
+# --- _parse_args: orchestrator call convention --------------------------------
+lo, only, excl = huc._parse_args(["--limits-only", "zai"])
+check(lo is True and only == {"zai"} and excl == set(), f"parse --limits-only zai: {lo} {only} {excl}")
+lo, only, excl = huc._parse_args(["--force", "--except", "claude", "--except", "kimi", "zai", "chatgpt"])
+check(lo is False and only == {"zai", "chatgpt"} and excl == {"claude", "kimi"},
+      f"parse force/except/ids: {lo} {only} {excl}")
+lo, only, excl = huc._parse_args([])
+check(lo is False and only == set() and excl == set(), f"parse empty: {lo} {only} {excl}")
+
+# --- retryAdvised policy ------------------------------------------------------
+check(huc._retry_advised("Z.AI API unavailable", "name resolution"), "transient should advise retry")
+check(not huc._retry_advised("Z.AI key invalid", "Check GLM_API_KEY"), "auth error must not advise retry")
+check(not huc._retry_advised("", ""), "success must not advise retry")
+
 if failures:
     print("FAIL")
     for f in failures:

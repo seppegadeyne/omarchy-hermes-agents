@@ -152,6 +152,17 @@ Item {
     }
   }
 
+  Process {
+    id: hermesProcess
+    running: false
+    onExited: root.rescanAgents()
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (text.trim() !== "") console.warn("agents-hermes", text.trim())
+    }
+  }
+
   function updateCommand(kind, agentIds) {
     var command = ["omarchy-agent-usage-update"]
     if (kind === "force") command.push("--force")
@@ -166,6 +177,40 @@ Item {
     return command
   }
 
+  // The stock orchestrator only reaches built-in collectors. Hermes-managed
+  // providers (zai, kimi, chatgpt, nous) come from hermes-usage-collector,
+  // which speaks the same flag convention (--force/--limits-only/--except/
+  // ids); run it alongside so panel-triggered refreshes and the 30s
+  // retryAdvised retry cover custom providers too.
+  property string hermesCollectorBin: {
+    var bin = Quickshell.env("HERMES_USAGE_COLLECTOR")
+    if (bin) return bin
+    var home = root.home
+    return home ? home + "/.local/bin/hermes-usage-collector" : ""
+  }
+
+  function hermesCollectorCommand(kind, agentIds) {
+    var command = [hermesCollectorBin]
+    if (kind === "limits") command.push("--limits-only")
+    var providers = settings && settings.providers ? settings.providers : {}
+    for (var id in providers) {
+      if (providers[id] && providers[id].enabled === false) command.push("--except", id)
+    }
+    if (agentIds) {
+      for (var i = 0; i < agentIds.length; i++) command.push(agentIds[i])
+    }
+    return command
+  }
+
+  function hasHermesProviders(agentIds) {
+    var custom = ["zai", "kimi", "chatgpt", "nous"]
+    var ids = agentIds && agentIds.length > 0 ? agentIds : root.agentIds
+    for (var i = 0; i < ids.length; i++) {
+      if (custom.indexOf(String(ids[i])) !== -1) return true
+    }
+    return false
+  }
+
   function runUpdate(kind, agentIds) {
     if (updateProcess.running) {
       // Collapse queued requests to one full rerun; a forced refresh outranks
@@ -175,6 +220,12 @@ Item {
     }
     updateProcess.command = updateCommand(kind, agentIds)
     updateProcess.running = true
+    // Custom Hermes providers refresh in parallel, but only when the panel
+    // actually shows any (record on disk = collector installed).
+    if (hermesCollectorBin !== "" && hasHermesProviders(agentIds)) {
+      hermesProcess.command = hermesCollectorCommand(kind, agentIds)
+      hermesProcess.running = true
+    }
   }
 
   function refresh() { refreshAll(true) }
