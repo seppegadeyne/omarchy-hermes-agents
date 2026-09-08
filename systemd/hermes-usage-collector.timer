@@ -2,7 +2,7 @@
 Description=Refresh Hermes usage data every 5 minutes
 
 [Timer]
-OnBootSec=30s
+OnBootSec=2min
 OnUnitActiveSec=5m
 Unit=hermes-usage-collector.service
 

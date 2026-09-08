@@ -66,6 +66,16 @@ Two deliberate safety rules learned the hard way (documented inline):
 - **ChatGPT 401 = idle-expired, not broken.** The access JWT has a 10-day
   TTL and Hermes refreshes lazily on the next real use; re-login is only
   needed when the refresh chain itself is revoked.
+- **Transient network failures never blank the panel.** A limits fetch that
+  fails on DNS/connection/timeout gets one retry after 5s (covers the timer
+  run racing system DNS at boot); if it still fails, the last good limits
+  are served from a cache (max 2h old, stored *outside* the usage directory
+  — the panel renders every `*.json` in there as a tab) with the status
+  suffixed "— showing cached limits". Auth errors (invalid key, relogin)
+  are never retried and never masked by cache. The panel's own
+  `retryAdvised` mechanism can't help here: it reruns
+  `omarchy-agent-usage-update`, which only reaches the stock built-in
+  collectors, not this one.
 
 ## Install
 

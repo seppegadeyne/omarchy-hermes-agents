@@ -16,6 +16,7 @@ Live limits:
 import json
 import sqlite3
 import sys
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -599,6 +600,117 @@ LIMIT_FETCHERS = {
 }
 
 
+# ── Transient-network resilience ─────────────────────────────────────────────
+# The panel shows usageStatusText/authHelpText as a scary red banner and drops
+# all limit meters whenever a limits fetch fails. A single DNS hiccup (e.g. the
+# OnBootSec=30s run racing system DNS at boot) or a brief provider outage then
+# wipes healthy data. Mitigate in three layers:
+#   1. Retry transient failures once after 5s (covers post-boot DNS warmup).
+#   2. On persistent failure, keep serving the last good limits from a cache
+#      file (staleness capped at 2h; afterwards the error wins).
+#   3. Tag the status text so the panel says "cached" instead of "unavailable".
+# NOTE: keep this OUTSIDE the usage/ directory — the panel scans usage/ for
+# *.json and would try to render the cache as a provider tab.
+LIMITS_CACHE_PATH = Path.home() / ".local" / "state" / "omarchy" / "agents" / "limits-cache.json"
+LIMITS_CACHE_MAX_AGE_S = 2 * 60 * 60  # 2h
+
+
+def _is_transient_fetch_error(status_text, auth_help):
+    """True when a fetch failure looks like a transient network problem
+    (name resolution, connection, timeout) rather than bad credentials."""
+    blob = f"{status_text} {auth_help}".lower()
+    transient_markers = (
+        "unavailable",          # "<Provider> API unavailable" / URLError branch
+        "temporary failure",
+        "name resolution",
+        "name or service",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "timed out",
+        "timeout",
+        "ssl",
+        "eof occurred",
+        "remote end closed",
+    )
+    # Auth problems (invalid key, relogin) are never transient.
+    if "invalid" in blob or "not authenticated" in blob or "relogin" in blob:
+        return False
+    return any(marker in blob for marker in transient_markers)
+
+
+def _load_limits_cache():
+    try:
+        cached = json.loads(LIMITS_CACHE_PATH.read_text())
+        if isinstance(cached, dict):
+            return cached
+    except Exception:
+        pass
+    return {}
+
+
+def _store_cached_limits(cache, provider_id, entry):
+    cache[provider_id] = entry
+    try:
+        tmp = LIMITS_CACHE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, indent=2))
+        tmp.replace(LIMITS_CACHE_PATH)
+    except Exception:
+        pass  # cache is best-effort; never fail the collector over it
+
+
+def fetch_limits_resilient(provider_id, fetcher, auth):
+    """Run a limits fetcher with one transient retry and stale-limit caching.
+
+    Returns (limits, tier_label, status_text, auth_help).
+    """
+    limits, tier_label, status_text, auth_help = fetcher(auth)
+
+    if limits or not status_text:
+        _store_cached_limits(
+            _load_limits_cache(),
+            provider_id,
+            {
+                "limits": limits,
+                "tierLabel": tier_label,
+                "storedAt": time.time(),
+            },
+        )
+        return limits, tier_label, status_text, auth_help
+
+    # Fetch failed: retry once for transient-looking errors (post-boot DNS
+    # warmup typically resolves within a few seconds).
+    if _is_transient_fetch_error(status_text, auth_help):
+        time.sleep(5)
+        limits, tier_label, status_text, auth_help = fetcher(auth)
+        if limits or not status_text:
+            _store_cached_limits(
+                _load_limits_cache(),
+                provider_id,
+                {
+                    "limits": limits,
+                    "tierLabel": tier_label,
+                    "storedAt": time.time(),
+                },
+            )
+            return limits, tier_label, status_text, auth_help
+
+    # Still failing: serve cached limits if fresh enough AND the failure is
+    # transient (network). Auth errors must surface honestly, not be masked
+    # by stale meters.
+    if not limits and status_text and _is_transient_fetch_error(status_text, auth_help):
+        cached_entry = _load_limits_cache().get(provider_id)
+        if isinstance(cached_entry, dict):
+            age = time.time() - float(cached_entry.get("storedAt") or 0)
+            cached_limits = cached_entry.get("limits")
+            if age <= LIMITS_CACHE_MAX_AGE_S and isinstance(cached_limits, list) and cached_limits:
+                cached_tier = cached_entry.get("tierLabel") or ""
+                cached_status = f"{status_text} — showing cached limits"
+                return cached_limits, cached_tier, cached_status, auth_help
+
+    return limits, tier_label, status_text, auth_help
+
+
 # ── Token usage from DB ──────────────────────────────────────────────────────
 
 
@@ -680,14 +792,17 @@ def collect_provider(conn, meta, auth):
             if first_day and last_day and first_day <= day <= last_day:
                 recent[day] += total
 
-    # Fetch live limits
+    # Fetch live limits (with transient retry + stale-limit caching so a
+    # post-boot DNS hiccup or brief outage doesn't blank the panel).
     limits = []
     tier_label = meta["tierLabel"]
     status_text = ""
     auth_help = ""
     limits_fn_name = meta.get("limits_fn")
     if limits_fn_name and limits_fn_name in LIMIT_FETCHERS:
-        limits, tier_label, status_text, auth_help = LIMIT_FETCHERS[limits_fn_name](auth)
+        limits, tier_label, status_text, auth_help = fetch_limits_resilient(
+            meta["id"], LIMIT_FETCHERS[limits_fn_name], auth
+        )
 
     record = {
         "schemaVersion": 1,
