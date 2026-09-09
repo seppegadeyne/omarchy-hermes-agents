@@ -24,8 +24,30 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 STATE_DB = Path.home() / ".hermes" / "state.db"
+PROFILES_DIR = Path.home() / ".hermes" / "profiles"
 AUTH_JSON = Path.home() / ".hermes" / "auth.json"
 USAGE_DIR = Path.home() / ".local" / "state" / "omarchy" / "agents" / "usage"
+
+
+def state_dbs():
+    """All Hermes state DBs on this machine: default profile first, then
+    every dedicated profile. Dedicated-profile agents (verhuurwinkel,
+    straffesites, ...) log their token usage into their own state.db —
+    skipping them undercounts models that are ONLY used there."""
+    paths = [STATE_DB] if STATE_DB.exists() else []
+    if PROFILES_DIR.is_dir():
+        paths.extend(sorted(PROFILES_DIR.glob("*/state.db")))
+    return paths
+
+
+def open_db_ro(path):
+    """Open a state.db strictly read-only: profile DBs are live databases
+    owned by running gateway daemons; a read-write handle could contend
+    with their write locks or journal files."""
+    return sqlite3.connect(f"file:{path}?mode=ro&immutable=0", uri=True)
+
+
+
 
 # Each entry: (display id, display name, tier label, SQL WHERE clause, SQL params)
 PROVIDERS = [
@@ -727,7 +749,7 @@ def _retry_advised(status_text, auth_help):
     return bool(status_text) and _is_transient_fetch_error(status_text, auth_help)
 
 
-def collect_provider(conn, meta, auth):
+def collect_provider(conns, meta, auth):
     now = datetime.now().astimezone()
     today_str = now.strftime("%Y-%m-%d")
     recent_dates = [
@@ -745,8 +767,7 @@ def collect_provider(conn, meta, auth):
     total_prompts = 0
     total_sessions = set()
 
-    rows = conn.execute(
-        f"""
+    query = f"""
         SELECT
             smu.model,
             smu.input_tokens,
@@ -761,12 +782,16 @@ def collect_provider(conn, meta, auth):
         FROM session_model_usage smu
         JOIN sessions s ON s.id = smu.session_id
         WHERE {meta["where"]}
-        """,
-        meta["params"],
-    ).fetchall()
+        """
 
-    for row in rows:
+    rows = []
+    for db_idx, conn in enumerate(conns):
+        db_rows = conn.execute(query, meta["params"]).fetchall()
+        rows.extend((db_idx, row) for row in db_rows)
+
+    for db_idx, row in rows:
         model, inp, outp, cr, cw, api_calls, cost, first_day, last_day, session_id = row
+        session_key = (db_idx, session_id)
         inp = inp or 0
         outp = outp or 0
         cr = cr or 0
@@ -785,7 +810,7 @@ def collect_provider(conn, meta, auth):
 
         prompts = max(api_calls or 0, 1)
         total_prompts += prompts
-        total_sessions.add(session_id)
+        total_sessions.add(session_key)
 
         if last_day:
             active_dates.add(last_day)
@@ -795,7 +820,7 @@ def collect_provider(conn, meta, auth):
         if first_day and last_day:
             if first_day <= today_str <= last_day:
                 today_prompts += prompts
-                today_sessions.add(session_id)
+                today_sessions.add(session_key)
                 today_total_tokens += total
                 today_tokens_by_model[model_name] = (
                     today_tokens_by_model.get(model_name, 0) + total
@@ -923,7 +948,7 @@ def main():
     USAGE_DIR.mkdir(parents=True, exist_ok=True)
     auth = load_auth()
 
-    conn = sqlite3.connect(str(STATE_DB))
+    conns = [open_db_ro(p) for p in state_dbs()]
     try:
         for meta in PROVIDERS:
             if only_ids and meta["id"] not in only_ids:
@@ -933,7 +958,7 @@ def main():
             if limits_only:
                 _refresh_limits_only(meta, auth)
                 continue
-            record = collect_provider(conn, meta, auth)
+            record = collect_provider(conns, meta, auth)
             out_path = USAGE_DIR / f"{meta['id']}.json"
             tmp_path = USAGE_DIR / f".{meta['id']}.tmp"
             tmp_path.write_text(json.dumps(record, indent=2) + "\n")
@@ -945,7 +970,8 @@ def main():
                 f"{len(record['limits'])} limits)"
             )
     finally:
-        conn.close()
+        for conn in conns:
+            conn.close()
 
     return 0
 

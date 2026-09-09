@@ -16,7 +16,8 @@ The Omarchy agents panel is strictly a display: it watches
 appears there, whoever wrote it. This repo adds two pieces on top of that:
 
 1. **`collector/hermes-usage-collector`** — a stdlib-only Python script that
-   reads Hermes' SQLite usage database (`~/.hermes/state.db`, table
+   reads Hermes' SQLite usage databases (default `~/.hermes/state.db` plus
+   every `~/.hermes/profiles/<name>/state.db`, all opened read-only, table
    `session_model_usage`) and fetches live limits from each provider's API,
    then writes one display-ready record per provider into the usage directory
    (atomic write: temp file + rename, so the panel never reads a half-written
@@ -28,6 +29,7 @@ appears there, whoever wrote it. This repo adds two pieces on top of that:
 
 ```
 ~/.hermes/state.db ─┐
+~/.hermes/profiles/*/state.db ─┐
 ~/.hermes/auth.json ├─> hermes-usage-collector ─> ~/.local/state/omarchy/agents/usage/*.json
 ~/.hermes/.env      ─┘         (every 5 min, systemd user timer)        │
                                                                        v
@@ -57,8 +59,14 @@ The collector never stores credentials. At each run it reads:
 When a token is missing or idle-expired, the record degrades gracefully: the
 panel keeps local token stats and shows a status line instead of meters.
 
-Two deliberate safety rules learned the hard way (documented inline):
+Deliberate safety rules learned the hard way (documented inline):
 
+- **All profile DBs are read, read-only.** Dedicated-profile agents
+  (verhuurwinkel, straffesites, ...) log token usage into their own
+  `~/.hermes/profiles/<name>/state.db`. Reading only the default DB
+  undercounts models that are primarily used there (gpt-6-astra looked
+  absent while ~1.66B tokens sat in profile DBs). All DBs are opened
+  `mode=ro` because they are live databases owned by running gateways.
 - **Nous tokens are never refreshed from the collector.** Nous refresh tokens
   are single-use and rotate on every refresh; Hermes' own auth layer owns
   that rotation. A second refresher races it, replays a retired token, and
