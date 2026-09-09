@@ -54,7 +54,8 @@ of which model handled it.
 The collector never stores credentials. At each run it reads:
 
 - `~/.hermes/auth.json` — OAuth tokens for Nous and ChatGPT, API-key pool
-- `~/.hermes/.env` — `KIMI_API_KEY`, `GLM_API_KEY` (or `ZAI_API_KEY`)
+- `~/.hermes/.env` — `KIMI_API_KEY`, and every filled Z.AI var
+  (`GLM_API_KEY` / `ZAI_API_KEY` / `Z_AI_API_KEY` — one pool key each)
 
 When a token is missing or idle-expired, the record degrades gracefully: the
 panel keeps local token stats and shows a status line instead of meters.
@@ -67,6 +68,13 @@ Deliberate safety rules learned the hard way (documented inline):
   undercounts models that are primarily used there (gpt-6-astra looked
   absent while ~1.66B tokens sat in profile DBs). All DBs are opened
   `mode=ro` because they are live databases owned by running gateways.
+- **Z.AI quota is fetched per key and summed per window — never scaled.**
+  Hermes rotates a pool of zai keys, and the monitor API reports usage per
+  key/account. Keys can sit on different plans (max + pro) with different
+  allowances, so the honest aggregate per window is sum(used)/sum(allowance)
+  with the earliest reset timestamp, and the tier label joins the distinct
+  plan levels ("Coding Plan · Max + Pro"). A single-key ×2 would have
+  overstated allowance (and understated usage) on the mixed-plan pool.
 - **Nous tokens are never refreshed from the collector.** Nous refresh tokens
   are single-use and rotate on every refresh; Hermes' own auth layer owns
   that rotation. A second refresher races it, replays a retired token, and

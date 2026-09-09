@@ -422,6 +422,7 @@ ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 #   unit 6 = weeks  → weekly quota (number = 1)
 ZAI_UNIT_LABELS = {(3, 5): "Session (5h)", (6, 1): "Weekly"}
 ZAI_FALLBACK_LABELS = {3: "Session (5h)", 6: "Weekly"}
+ZAI_ENV_KEY_VARS = ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY")
 
 
 def _parse_env_file(path):
@@ -437,95 +438,166 @@ def _parse_env_file(path):
     return env
 
 
-def get_zai_api_key(auth):
-    """Find the Z.AI API key: credential pool entry (env-backed) or .env file."""
+def get_zai_api_keys(auth):
+    """Collect every distinct Z.AI API key, in pool/env priority order.
+
+    The credential pool stores env-backed entries WITHOUT the raw key
+    (reference + fingerprint only), so the authoritative source is the
+    .env file. Every filled var out of GLM_API_KEY / ZAI_API_KEY /
+    Z_AI_API_KEY is one pool key (Hermes seeds one pool entry per var);
+    duplicates are de-duplicated while preserving order.
+    """
+    keys = []
+
+    def _add(key):
+        if isinstance(key, str) and key and key not in keys:
+            keys.append(key)
+
+    # Pool entries that DO carry a raw token (manual `hermes auth add`).
     pool = auth.get("credential_pool", {}).get("zai", [])
     for entry in pool:
         if isinstance(entry, dict):
             for field in ("access_token", "api_key", "apiKey", "secret", "token"):
-                value = entry.get(field)
-                if isinstance(value, str) and value:
-                    return value
+                _add(entry.get(field))
+
     env = _parse_env_file(Path.home() / ".hermes" / ".env")
-    return env.get("GLM_API_KEY") or env.get("ZAI_API_KEY") or ""
+    for var in ZAI_ENV_KEY_VARS:
+        _add(env.get(var))
+
+    return keys
+
+
+def _fetch_zai_quota(api_key):
+    """One GET on the quota endpoint for a single key. Returns the parsed
+    `data` payload dict, or raises urllib.error.HTTPError / Exception."""
+    req = urllib.request.Request(
+        ZAI_QUOTA_URL,
+        headers={
+            "Authorization": api_key,
+            "Accept-Language": "en-US,en",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+    return data.get("data", data) if isinstance(data, dict) else {}
 
 
 def fetch_zai_limits(auth):
-    """Fetch session (5h) + weekly quota usage from the Z.AI monitor API.
+    """Fetch session (5h) + weekly quota usage from the Z.AI monitor API,
+    aggregated across EVERY pooled Z.AI key.
 
-    Endpoint: GET https://api.z.ai/api/monitor/usage/quota/limit
-    Auth: raw API key in the Authorization header (no Bearer prefix).
+    Hermes rotates a credential pool of zai keys (fill_first), and the
+    monitor API reports usage per key/account — keys on different plans
+    (max + pro) have different allowances, so the honest aggregate is the
+    SUM of used and the SUM of allowance per window, never a ×2 of one
+    key's numbers.
 
-    Response limits entries carry: type (CREDIT_LIMIT), unit (3=hours,
-    6=weeks), number (window size), usage (allowance), currentValue (used),
-    remaining, percentage (0-100), nextResetTime (epoch milliseconds).
+    Per window (unit/number): sums `usage` (allowance) and `currentValue`
+    (used) over all keys, takes the EARLIEST nextResetTime (the first key
+    that will reset), and builds the label "Window (used/total)".
+    tierLabel joins the distinct plan levels, e.g. "Coding Plan · Max + Pro".
 
     Returns (limits_list, tier_label, status_text, auth_help).
     """
-    api_key = get_zai_api_key(auth)
-    if not api_key:
+    api_keys = get_zai_api_keys(auth)
+    if not api_keys:
         return [], "", "Z.AI key not found", "Set GLM_API_KEY in ~/.hermes/.env"
 
-    try:
-        req = urllib.request.Request(
-            ZAI_QUOTA_URL,
-            headers={
-                "Authorization": api_key,
-                "Accept-Language": "en-US,en",
-                "Content-Type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
+    # (unit, number) -> {usage, used, reset_ms, resets_iso}
+    windows = {}
+    levels = []
+    errors = []
+    for api_key in api_keys:
+        try:
+            payload = _fetch_zai_quota(api_key)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                errors.append("1 key invalid (check GLM/ZAI_API_KEY in ~/.hermes/.env)")
+            else:
+                errors.append(f"Z.AI API error ({exc.code})")
+            continue
+        except Exception:
+            # Keep the transient marker word "unavailable" so the panel's
+            # retryAdvised 30s retry picks this up as a transient failure.
+            errors.append("Z.AI API unavailable")
+            continue
 
-        payload = data.get("data", data)
-        raw_limits = payload.get("limits", [])
         level = payload.get("level", "")
-        tier_label = f"Coding Plan · {level.capitalize()}" if level else "Coding Plan"
-
-        limits = []
-        for item in raw_limits:
+        if level and level not in levels:
+            levels.append(level)
+        for item in payload.get("limits", []):
             if not isinstance(item, dict):
                 continue
-            unit = item.get("unit")
-            number = item.get("number")
-            label = ZAI_UNIT_LABELS.get((unit, number)) or ZAI_FALLBACK_LABELS.get(
-                unit, "Quota"
-            )
+            win_key = (item.get("unit"), item.get("number"))
+            usage = item.get("usage")
             used = item.get("currentValue")
-            allowance = item.get("usage")
-            pct = item.get("percentage")
-            if isinstance(pct, (int, float)):
-                percent = float(pct) / 100.0
-            elif isinstance(used, (int, float)) and isinstance(allowance, (int, float)) and allowance > 0:
-                percent = used / allowance
-            else:
+            if not isinstance(usage, (int, float)) or not isinstance(used, (int, float)):
                 continue
-            # Include allowance context in the label when available
-            if isinstance(used, (int, float)) and isinstance(allowance, (int, float)):
-                label = f"{label} ({used}/{allowance})"
-            resets_iso = ""
+            bucket = windows.setdefault(
+                win_key, {"usage": 0.0, "used": 0.0, "reset_ms": None, "resets_iso": ""}
+            )
+            bucket["usage"] += usage
+            bucket["used"] += used
             reset_ms = item.get("nextResetTime")
             if isinstance(reset_ms, (int, float)) and reset_ms > 0:
-                try:
-                    resets_iso = datetime.fromtimestamp(
-                        reset_ms / 1000.0, timezone.utc
-                    ).isoformat()
-                except Exception:
-                    resets_iso = ""
-            limits.append({
-                "label": label,
-                "percent": min(max(percent, 0.0), 1.0),
-                "resetsAt": resets_iso,
-            })
+                if bucket["reset_ms"] is None or reset_ms < bucket["reset_ms"]:
+                    bucket["reset_ms"] = reset_ms
+                    try:
+                        bucket["resets_iso"] = datetime.fromtimestamp(
+                            reset_ms / 1000.0, timezone.utc
+                        ).isoformat()
+                    except Exception:
+                        bucket["resets_iso"] = ""
 
-        return limits, tier_label, "", ""
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            return [], "", "Z.AI key invalid", "Check GLM_API_KEY in ~/.hermes/.env"
-        return [], "", f"Z.AI API error ({exc.code})", ""
-    except Exception as exc:
-        return [], "", "Z.AI API unavailable", str(exc)
+    if not windows:
+        # Every key failed: surface honestly. All-401 is an auth problem
+        # (never transient); anything else keeps the transient marker.
+        invalid = sum(1 for e in errors if "invalid" in e)
+        if api_keys and invalid == len(api_keys):
+            return [], "", "All Z.AI keys invalid", "Check GLM/ZAI_API_KEY in ~/.hermes/.env"
+        return [], "", errors[0] if errors else "Z.AI API unavailable", ""
+
+    # Stable window order: session (unit 3) before weekly (unit 6).
+    def _win_sort(win_key):
+        unit, number = win_key
+        if unit == 3:
+            return (0, number or 0)
+        if unit == 6:
+            return (1, number or 0)
+        return (2, 0)
+
+    limits = []
+    for win_key in sorted(windows, key=_win_sort):
+        bucket = windows[win_key]
+        if bucket["usage"] <= 0:
+            continue
+        label = ZAI_UNIT_LABELS.get(win_key) or ZAI_FALLBACK_LABELS.get(
+            win_key[0], "Quota"
+        )
+        # Integer totals when both sides are integral (typical API values).
+        used_disp = int(bucket["used"]) if float(bucket["used"]).is_integer() else round(bucket["used"], 1)
+        usage_disp = int(bucket["usage"]) if float(bucket["usage"]).is_integer() else round(bucket["usage"], 1)
+        percent = bucket["used"] / bucket["usage"]
+        limits.append({
+            "label": f"{label} ({used_disp}/{usage_disp})",
+            "percent": min(max(percent, 0.0), 1.0),
+            "resetsAt": bucket["resets_iso"],
+        })
+
+    tier_label = (
+        "Coding Plan · " + " + ".join(l.capitalize() for l in levels)
+        if levels
+        else "Coding Plan"
+    )
+    # A healthy key keeps meters alive even when a sibling key errors:
+    # mention it in the status line without failing the whole provider.
+    if errors:
+        prefix = f"{len(errors)}/{len(api_keys)} keys failed"
+        status_text = f"{prefix}: {errors[0]}"
+    else:
+        status_text = ""
+    return limits, tier_label, status_text, ""
 
 
 def fetch_chatgpt_limits(auth):
