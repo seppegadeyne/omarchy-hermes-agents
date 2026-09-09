@@ -57,8 +57,10 @@ PROVIDERS = [
         "tierLabel": "Coding Plan",
         "scope": "machine",
         # Kimi usage is stored under billing_provider 'kimi-coding', or 'auto'
-        # with an api.kimi.com base URL.
-        "where": "(smu.billing_provider = 'kimi-coding' OR (smu.billing_provider = 'auto' AND smu.billing_base_url LIKE '%api.kimi.com%'))",
+        # with an api.kimi.com base URL. The model-family filter drops
+        # cross-billed legacy rows (e.g. a 2026-08-24 CLI session that ran
+        # --model gpt-5.6-sol while the provider still pointed at kimi).
+        "where": "(smu.billing_provider = 'kimi-coding' OR (smu.billing_provider = 'auto' AND smu.billing_base_url LIKE '%api.kimi.com%')) AND (smu.model LIKE '%kimi%' OR smu.model LIKE 'k3%')",
         "params": (),
         "limits_fn": "fetch_kimi_limits",
     },
@@ -68,8 +70,8 @@ PROVIDERS = [
         "tierLabel": "Coding Plan",
         "scope": "machine",
         # Z.AI usage is stored under billing_provider 'zai', or 'auto' with an
-        # api.z.ai base URL.
-        "where": "(smu.billing_provider = 'zai' OR (smu.billing_provider = 'auto' AND smu.billing_base_url LIKE '%api.z.ai%'))",
+        # api.z.ai base URL. Family filter: Z.AI plans only serve GLM models.
+        "where": "(smu.billing_provider = 'zai' OR (smu.billing_provider = 'auto' AND smu.billing_base_url LIKE '%api.z.ai%')) AND smu.model LIKE '%glm%'",
         "params": (),
         "limits_fn": "fetch_zai_limits",
     },
@@ -79,8 +81,9 @@ PROVIDERS = [
         "tierLabel": "Subscription",
         "scope": "machine",
         # ChatGPT usage via Hermes is stored under openai-codex or auto,
-        # always with a chatgpt.com base URL.
-        "where": "(smu.billing_provider IN ('openai-codex', 'auto') AND smu.billing_base_url LIKE '%chatgpt.com%')",
+        # always with a chatgpt.com base URL. Family filter: OpenAI models
+        # only (drops e.g. a stray qwen row billed under openai-codex).
+        "where": "(smu.billing_provider IN ('openai-codex', 'auto') AND smu.billing_base_url LIKE '%chatgpt.com%') AND (smu.model LIKE '%gpt%' OR smu.model LIKE '%codex%' OR smu.model LIKE 'o1%' OR smu.model LIKE 'o3%' OR smu.model LIKE 'o4%')",
         "params": (),
         "limits_fn": "fetch_chatgpt_limits",
     },
