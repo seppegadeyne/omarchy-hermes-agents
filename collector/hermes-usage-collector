@@ -485,17 +485,23 @@ def _fetch_zai_quota(api_key):
 
 def fetch_zai_limits(auth):
     """Fetch session (5h) + weekly quota usage from the Z.AI monitor API,
-    aggregated across EVERY pooled Z.AI key.
+    grouped per plan level across the pooled Z.AI keys.
 
     Hermes rotates a credential pool of zai keys (fill_first), and the
-    monitor API reports usage per key/account — keys on different plans
-    (max + pro) have different allowances, so the honest aggregate is the
-    SUM of used and the SUM of allowance per window, never a ×2 of one
-    key's numbers.
+    monitor API reports usage per key/account. Keys on different plans
+    (max + pro) have DIFFERENT allowances with independent windows: a
+    cross-level sum invents a pool that does not exist (the blended
+    percent matches no real key and hides a nearly-exhausted one), so
+    keys are grouped by their `level` first and never summed across
+    levels. Keys on the SAME level get summed per window — identical
+    allowances make that an honest pool view.
 
-    Per window (unit/number): sums `usage` (allowance) and `currentValue`
-    (used) over all keys, takes the EARLIEST nextResetTime (the first key
-    that will reset), and builds the label "Window (used/total)".
+    Per level and window (unit/number): sums `usage` (allowance) and
+    `currentValue` (used) over that level's keys, takes the EARLIEST
+    nextResetTime (the first key that will reset), and builds the label
+    "Window (used/total)". With 2+ distinct levels every meter also gets
+    an explicit title "Level · Window" (Panel.qml prefers `title` over
+    parsing the label), so the panel shows one meter per plan window.
     tierLabel joins the distinct plan levels, e.g. "Coding Plan · Max + Pro".
 
     Returns (limits_list, tier_label, status_text, auth_help).
@@ -504,9 +510,8 @@ def fetch_zai_limits(auth):
     if not api_keys:
         return [], "", "Z.AI key not found", "Set GLM_API_KEY in ~/.hermes/.env"
 
-    # (unit, number) -> {usage, used, reset_ms, resets_iso}
-    windows = {}
-    levels = []
+    # level -> {(unit, number) -> {usage, used, reset_ms, resets_iso}}
+    windows_by_level = {}
     errors = []
     for api_key in api_keys:
         try:
@@ -523,9 +528,8 @@ def fetch_zai_limits(auth):
             errors.append("Z.AI API unavailable")
             continue
 
-        level = payload.get("level", "")
-        if level and level not in levels:
-            levels.append(level)
+        level = str(payload.get("level", "") or "").strip() or "plan"
+        group = windows_by_level.setdefault(level, {})
         for item in payload.get("limits", []):
             if not isinstance(item, dict):
                 continue
@@ -534,7 +538,7 @@ def fetch_zai_limits(auth):
             used = item.get("currentValue")
             if not isinstance(usage, (int, float)) or not isinstance(used, (int, float)):
                 continue
-            bucket = windows.setdefault(
+            bucket = group.setdefault(
                 win_key, {"usage": 0.0, "used": 0.0, "reset_ms": None, "resets_iso": ""}
             )
             bucket["usage"] += usage
@@ -550,7 +554,7 @@ def fetch_zai_limits(auth):
                     except Exception:
                         bucket["resets_iso"] = ""
 
-    if not windows:
+    if not windows_by_level:
         # Every key failed: surface honestly. All-401 is an auth problem
         # (never transient); anything else keeps the transient marker.
         invalid = sum(1 for e in errors if "invalid" in e)
@@ -567,24 +571,30 @@ def fetch_zai_limits(auth):
             return (1, number or 0)
         return (2, 0)
 
+    multi_level = len(windows_by_level) > 1
     limits = []
-    for win_key in sorted(windows, key=_win_sort):
-        bucket = windows[win_key]
-        if bucket["usage"] <= 0:
-            continue
-        label = ZAI_UNIT_LABELS.get(win_key) or ZAI_FALLBACK_LABELS.get(
-            win_key[0], "Quota"
-        )
-        # Integer totals when both sides are integral (typical API values).
-        used_disp = int(bucket["used"]) if float(bucket["used"]).is_integer() else round(bucket["used"], 1)
-        usage_disp = int(bucket["usage"]) if float(bucket["usage"]).is_integer() else round(bucket["usage"], 1)
-        percent = bucket["used"] / bucket["usage"]
-        limits.append({
-            "label": f"{label} ({used_disp}/{usage_disp})",
-            "percent": min(max(percent, 0.0), 1.0),
-            "resetsAt": bucket["resets_iso"],
-        })
+    for level in sorted(windows_by_level):
+        for win_key in sorted(windows_by_level[level], key=_win_sort):
+            bucket = windows_by_level[level][win_key]
+            if bucket["usage"] <= 0:
+                continue
+            label = ZAI_UNIT_LABELS.get(win_key) or ZAI_FALLBACK_LABELS.get(
+                win_key[0], "Quota"
+            )
+            # Integer totals when both sides are integral (typical API values).
+            used_disp = int(bucket["used"]) if float(bucket["used"]).is_integer() else round(bucket["used"], 1)
+            usage_disp = int(bucket["usage"]) if float(bucket["usage"]).is_integer() else round(bucket["usage"], 1)
+            percent = bucket["used"] / bucket["usage"]
+            entry = {
+                "label": f"{label} ({used_disp}/{usage_disp})",
+                "percent": min(max(percent, 0.0), 1.0),
+                "resetsAt": bucket["resets_iso"],
+            }
+            if multi_level:
+                entry["title"] = f"{level.capitalize()} · {label}"
+            limits.append(entry)
 
+    levels = list(windows_by_level)
     tier_label = (
         "Coding Plan · " + " + ".join(l.capitalize() for l in levels)
         if levels

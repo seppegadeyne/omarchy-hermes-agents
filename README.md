@@ -68,13 +68,19 @@ Deliberate safety rules learned the hard way (documented inline):
   undercounts models that are primarily used there (gpt-6-astra looked
   absent while ~1.66B tokens sat in profile DBs). All DBs are opened
   `mode=ro` because they are live databases owned by running gateways.
-- **Z.AI quota is fetched per key and summed per window — never scaled.**
-  Hermes rotates a pool of zai keys, and the monitor API reports usage per
-  key/account. Keys can sit on different plans (max + pro) with different
-  allowances, so the honest aggregate per window is sum(used)/sum(allowance)
-  with the earliest reset timestamp, and the tier label joins the distinct
-  plan levels ("Coding Plan · Max + Pro"). A single-key ×2 would have
-  overstated allowance (and understated usage) on the mixed-plan pool.
+- **Z.AI quota is fetched per key and grouped by plan LEVEL — never summed
+  across levels, never scaled.** Hermes rotates a pool of zai keys, and the
+  monitor API reports usage per key/account. Keys on different plans (max +
+  pro) have different allowances with independent reset windows: a
+  cross-level sum invents a pool that does not exist (the blended percent
+  matches no real key — 2502/28000 max + 39723/60000 pro summed to a
+  fictional 24% weekly while the pro key was at 66%). Each level gets its
+  own meters ("Max · Session (5h)", "Pro · Weekly") with an explicit
+  `title` (Panel.qml prefers `title` over label parsing). Keys on the SAME
+  level are still summed per window (identical allowances make that an
+  honest pool view), with the earliest reset timestamp and joined tier
+  label ("Coding Plan · Max + Pro"). A single-key ×2 would have overstated
+  allowance (and understated usage) on the mixed-plan pool.
 - **Nous tokens are never refreshed from the collector.** Nous refresh tokens
   are single-use and rotate on every refresh; Hermes' own auth layer owns
   that rotation. A second refresher races it, replays a retired token, and

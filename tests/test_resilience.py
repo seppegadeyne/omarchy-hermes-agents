@@ -108,9 +108,12 @@ check(not huc._retry_advised("Z.AI key invalid", "Check GLM_API_KEY"), "auth err
 check(not huc._retry_advised("", ""), "success must not advise retry")
 
 # --- Z.AI multi-key aggregation (pooled keys, mixed plans) ---------------------
-# fetch_zai_limits must fetch per key and SUM per window: keys on different
-# plans (max + pro) have different allowances, so percent is
-# sum(currentValue)/sum(usage) — never a ×2 of one key's numbers.
+# fetch_zai_limits must fetch per key and group by plan LEVEL: keys on
+# different plans (max + pro) have different allowances with independent
+# windows, so they get separate meters ("Max · Session", "Pro · Weekly"),
+# never a cross-level sum — the blended percent matches no real key and
+# hides a nearly-exhausted one. Keys on the SAME level are summed per
+# window (identical allowances make that an honest pool view).
 import json
 import urllib.error as _urlerr
 
@@ -148,25 +151,44 @@ def _quota_payload(level, session, weekly):
 
 saved_keys_fn, saved_fetch = huc.get_zai_api_keys, huc._fetch_zai_quota
 try:
-    # Two keys: max plan (28000/140000) + pro plan (12000/60000), different resets.
+    # Two keys on different plans: one meter per level+window, no cross-level
+    # sum. This mirrors the real pool (max 2502/28000 + pro 39723/60000) where
+    # the old sum showed a fictional 24% weekly pool.
     huc.get_zai_api_keys = lambda auth: ["key-max", "key-pro"]
     huc._fetch_zai_quota = lambda key: (
         _quota_payload("max", (16658, 28000, 1000000000000), (135411, 140000, 2000000000000))
         if key == "key-max"
-        else _quota_payload("pro", (0, 12000, 1500000000000), (0, 60000, 3000000000000))
+        else _quota_payload("pro", (0, 12000, 1500000000000), (39723, 60000, 3000000000000))
     )
     limits, tier, status, help_ = huc.fetch_zai_limits({})
-    check(len(limits) == 2, f"expected 2 windows, got {len(limits)}")
-    check(limits[0]["label"] == "Session (5h) (16658/40000)",
-          f"session label not summed: {limits[0]['label']!r}")
-    check(abs(limits[0]["percent"] - 16658 / 40000) < 1e-9,
-          f"session percent not sum/sum: {limits[0]['percent']}")
-    check(limits[1]["label"] == "Weekly (135411/200000)",
-          f"weekly label not summed: {limits[1]['label']!r}")
-    check(limits[0]["resetsAt"].startswith("2001-09-09"),  # 1e12 ms = earliest reset
-          f"session reset not earliest: {limits[0]['resetsAt']!r}")
+    check(len(limits) == 4, f"expected 4 meters (2 levels x 2 windows), got {len(limits)}")
+    check(limits[0].get("title") == "Max · Session (5h)",
+          f"max session title wrong: {limits[0].get('title')!r}")
+    check(limits[0]["label"] == "Session (5h) (16658/28000)",
+          f"max session label wrong: {limits[0]['label']!r}")
+    check(abs(limits[0]["percent"] - 16658 / 28000) < 1e-9,
+          f"max session percent not per-level: {limits[0]['percent']}")
+    check(limits[3].get("title") == "Pro · Weekly",
+          f"pro weekly title wrong: {limits[3].get('title')!r}")
+    check(limits[3]["label"] == "Weekly (39723/60000)",
+          f"pro weekly label wrong: {limits[3]['label']!r}")
+    check(abs(limits[3]["percent"] - 39723 / 60000) < 1e-9,
+          f"pro weekly percent not per-level: {limits[3]['percent']}")
+    check(limits[0]["resetsAt"].startswith("2001-09-09"),  # 1e12 ms = that key's reset
+          f"max session reset wrong: {limits[0]['resetsAt']!r}")
     check(tier == "Coding Plan · Max + Pro", f"mixed-plan tier: {tier!r}")
     check(status == "" and help_ == "", f"healthy pool got status: {status!r} {help_!r}")
+
+    # Single-plan pool (both keys max): sum per window, NO per-level titles —
+    # identical allowances make the sum an honest pool view.
+    huc._fetch_zai_quota = lambda key: _quota_payload(
+        "max", (10, 28000, 1000000000000), (10, 140000, 2000000000000))
+    huc.get_zai_api_keys = lambda auth: ["key-a", "key-b"]
+    limits, tier, status, help_ = huc.fetch_zai_limits({})
+    check(len(limits) == 2, f"same-level pool should stay 2 meters, got {len(limits)}")
+    check(limits[0]["label"] == "Session (5h) (20/56000)",
+          f"same-level sum wrong: {limits[0]['label']!r}")
+    check("title" not in limits[0], f"single-level pool must not carry titles: {limits[0]!r}")
 
     # One healthy key + one 401 key: meters stay, status mentions the failure.
     def _fail_401(key):
