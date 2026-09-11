@@ -47,7 +47,10 @@ Panel {
   // last 10% of the funded credits lights the same alarm.
   readonly property bool balanceAlarming: !!balance && balance.funded > 0
     && balance.remaining / balance.funded <= 0.1
-  readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming
+  // One threshold for the bar icon and the headline it comes from, so the
+  // binding-window logic and the alarm stay in lockstep.
+  readonly property real alarmThreshold: 0.9
+  readonly property bool alarming: (!!headline && headline.percent >= alarmThreshold) || balanceAlarming
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
@@ -125,14 +128,39 @@ Panel {
   }
 
   // The window that decides how much room is left — the fullest one, since
-  // that is what stops the next prompt.
+  // that is what stops the next prompt. Pooled credentials complicate that:
+  // a provider rotating several keys (zai's max + pro) has one binding
+  // window PER POOL, and healthy pools back up exhausted ones. The headline
+  // therefore follows the pool with the most room while any pool can still
+  // take prompts; only when every pool sits at its binding window does the
+  // globally fullest one take over. That is what feeds the bar icon, so one
+  // maxed-out key no longer paints the widget red while its sibling key
+  // still has plenty of allowance left.
+  function poolNameForTitle(title) {
+    var text = String(title || "")
+    var cut = text.indexOf("·")
+    return cut > 0 ? text.substring(0, cut).trim() : ""
+  }
+
   function bindingWindow(p) {
     var windows = limitWindows(p)
-    var best = null
+    var fullest = null
+    var poolWindows = ({})  // pool name -> that pool's fullest window
+    var poolOrder = []
     for (var i = 0; i < windows.length; i++) {
-      if (!best || windows[i].percent > best.percent) best = windows[i]
+      var w = windows[i]
+      if (!fullest || w.percent > fullest.percent) fullest = w
+      var pool = poolNameForTitle(w.title)
+      if (!Object.prototype.hasOwnProperty.call(poolWindows, pool)) { poolWindows[pool] = null; poolOrder.push(pool) }
+      if (!poolWindows[pool] || w.percent > poolWindows[pool].percent) poolWindows[pool] = w
     }
-    return best
+    var roomiest = null
+    for (var j = 0; j < poolOrder.length; j++) {
+      var worst = poolWindows[poolOrder[j]]
+      if (worst && (!roomiest || worst.percent < roomiest.percent)) roomiest = worst
+    }
+    if (roomiest && roomiest.percent < alarmThreshold) return roomiest
+    return fullest
   }
 
   function resetMsFor(w) {

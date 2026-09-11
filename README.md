@@ -85,6 +85,16 @@ Deliberate safety rules learned the hard way (documented inline):
   are single-use and rotate on every refresh; Hermes' own auth layer owns
   that rotation. A second refresher races it, replays a retired token, and
   the portal revokes the whole session family.
+- **The bar icon alarm is pool-aware.** `bindingWindow()` in Panel.qml used
+  to pick the single fullest meter across the whole provider, so one
+  maxed-out key painted the widget red while a sibling key on another plan
+  still had plenty of allowance (zai: pro weekly 100% vs max 35% → red,
+  even though Hermes happily rotates to the max key). Meters carry the
+  pool name in their title prefix ("Max · …", "Pro · …"); the headline now
+  follows the roomiest pool's binding window while that pool is below the
+  alarm threshold, and only goes red when EVERY pool is ≥ 90%. Single-pool
+  providers (kimi, chatgpt, nous) are one pool, so their behavior is
+  unchanged.
 - **ChatGPT 401 = idle-expired, not broken.** The access JWT has a 10-day
   TTL and Hermes refreshes lazily on the next real use; re-login is only
   needed when the refresh chain itself is revoked.
