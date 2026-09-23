@@ -85,6 +85,18 @@ Deliberate safety rules learned the hard way (documented inline):
   are single-use and rotate on every refresh; Hermes' own auth layer owns
   that rotation. A second refresher races it, replays a retired token, and
   the portal revokes the whole session family.
+- **ChatGPT limits fall back to fresh same-account profile tokens.** The
+  default profile's openai-codex OAuth chain sits idle when real traffic
+  runs from dedicated profiles, so its 10-day access token expires — and
+  the lazy "one-shot call refreshes it" recovery fails hard once the
+  refresh chain itself is revoked (`refresh_token_reused`, seen 2026-09-23:
+  red empty panel frame for days while gpt-* usage kept logging from
+  profile agents). The collector gathers access tokens from the default
+  auth.json AND every `~/.hermes/profiles/*/auth.json`, pins them to the
+  default token's `chatgpt_account_id` (a different-account profile can
+  never skew the meter), tries them freshest-JWT-first, and only surfaces
+  an auth error when ALL candidates 401. Read-only use; the collector still
+  never refreshes openai-codex tokens.
 - **The bar icon alarm is pool-aware.** `bindingWindow()` in Panel.qml used
   to pick the single fullest meter across the whole provider, so one
   maxed-out key painted the widget red while a sibling key on another plan

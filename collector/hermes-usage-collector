@@ -13,6 +13,7 @@ Live limits:
 - ChatGPT: https://chatgpt.com/backend-api/wham/usage with Hermes-stored tokens.
 """
 
+import base64
 import json
 import sqlite3
 import sys
@@ -610,32 +611,85 @@ def fetch_zai_limits(auth):
     return limits, tier_label, status_text, ""
 
 
+def _jwt_payload(token):
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def _chatgpt_token_candidates(auth):
+    """Collect openai-codex access tokens from default + profile auth.json files.
+
+    Dedicated profile agents (voltti, straffesites, ...) run openai-codex
+    traffic daily and refresh their own OAuth chains, while the default
+    profile's chain can sit idle until its 10-day access token expires (or
+    its refresh chain gets revoked). The wham/usage endpoint is account-level
+    and read-only, so any fresh token FOR THE SAME ChatGPT account returns
+    the same limits. Gather tokens from every auth.json, keep only the
+    default token's account, sort freshest-first (JWT exp). Never refresh
+    from the collector — refresh tokens are single-use and Hermes owns
+    rotation.
+    """
+    def tokens_from(d):
+        toks = []
+        oc = d.get("providers", {}).get("openai-codex", {}) or {}
+        t = (oc.get("tokens") or {}).get("access_token", "")
+        if t:
+            toks.append(t)
+        for entry in d.get("credential_pool", {}).get("openai-codex", []) or []:
+            if isinstance(entry, dict):
+                t = entry.get("access_token", "")
+                if t:
+                    toks.append(t)
+        return toks
+
+    candidates = tokens_from(auth)
+    if PROFILES_DIR.exists():
+        for auth_path in sorted(PROFILES_DIR.glob("*/auth.json")):
+            try:
+                candidates.extend(tokens_from(json.loads(auth_path.read_text())))
+            except Exception:
+                continue
+
+    # Dedupe, keep insertion order (default profile first).
+    seen, uniq = set(), []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+
+    # Pin to the default profile's ChatGPT account when it has a token, so a
+    # profile logged into a DIFFERENT account can never skew the meter.
+    def account_of(t):
+        return (_jwt_payload(t).get("https://api.openai.com/auth", {}) or {}).get("chatgpt_account_id")
+
+    default_account = account_of(uniq[0]) if uniq else None
+    if default_account:
+        same = [t for t in uniq if account_of(t) == default_account]
+        if same:
+            uniq = same
+
+    uniq.sort(key=lambda t: _jwt_payload(t).get("exp", 0), reverse=True)
+    return uniq
+
+
 def fetch_chatgpt_limits(auth):
     """Fetch rate limits from ChatGPT wham/usage API with Hermes-stored tokens.
 
     Returns (limits_list, tier_label, status_text, auth_help).
-    Uses the openai-codex tokens from auth.json (auth_mode=chatgpt).
+    Uses openai-codex access tokens from the default profile first, then
+    falls back to fresh same-account tokens from dedicated profile auth.json
+    files (read-only; see _chatgpt_token_candidates).
     """
-    providers = auth.get("providers", {})
-    oc = providers.get("openai-codex", {})
-    tokens = oc.get("tokens", {})
-    access_token = tokens.get("access_token", "")
+    candidates = _chatgpt_token_candidates(auth)
 
-    if not access_token:
-        # Hermes stores fresh OAuth logins in the credential pool, not in the
-        # legacy providers.openai-codex.tokens path.
-        pool = auth.get("credential_pool", {}).get("openai-codex", [])
-        for entry in pool:
-            if not isinstance(entry, dict):
-                continue
-            access_token = entry.get("access_token", "")
-            if access_token:
-                break
-
-    if not access_token:
+    if not candidates:
         return [], "", "ChatGPT not authenticated", "Run `hermes auth add openai-codex --type oauth`"
 
-    try:
+    def call_api(access_token):
         url = "https://chatgpt.com/backend-api/wham/usage"
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -644,8 +698,35 @@ def fetch_chatgpt_limits(auth):
         }
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read())
+            return json.loads(resp.read())
 
+    payload = None
+    last_error = None
+    saw_401 = False
+    for token in candidates:
+        try:
+            payload = call_api(token)
+            break
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 401:
+                # Expired/revoked access token — try the next candidate.
+                saw_401 = True
+                continue
+            return [], "", f"ChatGPT API error ({exc.code})", ""
+        except Exception as exc:
+            return [], "", "ChatGPT API unavailable", str(exc)
+
+    if payload is None:
+        if saw_401:
+            # Every candidate 401'd: all OAuth chains (default + profiles)
+            # are dead. Hermes refreshes lazily on real openai-codex use,
+            # but a revoked refresh chain (refresh_token_reused in
+            # providers.openai-codex.last_auth_error) needs a real re-login.
+            return [], "", "ChatGPT token expired on all profiles", "Run `hermes auth add openai-codex --type oauth`"
+        return [], "", f"ChatGPT API error ({last_error.code})", "" if last_error else ""
+
+    try:
         plan = payload.get("plan_type") or ""
         tier_label = plan.capitalize() if plan else ""
 
@@ -682,19 +763,6 @@ def fetch_chatgpt_limits(auth):
             })
 
         return limits, tier_label, "", ""
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            # Idle-expired access token (10-day JWT TTL, Hermes refreshes
-            # lazily on the next real openai-codex use). Verified 2026-09-02:
-            # panel said "token expired" while Hermes auth was fine; one
-            # one-shot `hermes -z ... --provider openai-codex` call rotated
-            # the token and the meter recovered. Re-login (`hermes auth add
-            # openai-codex --type oauth`) is only needed when the refresh
-            # chain itself is revoked (refresh_token_reused in
-            # providers.openai-codex.last_auth_error) — do not suggest it
-            # for a plain idle expiry.
-            return [], "", "ChatGPT token idle-expired (refreshes on next Hermes use)", ""
-        return [], "", f"ChatGPT API error ({exc.code})", ""
     except Exception as exc:
         return [], "", "ChatGPT API unavailable", str(exc)
 
