@@ -110,6 +110,29 @@ Deliberate safety rules learned the hard way (documented inline):
 - **ChatGPT 401 = idle-expired, not broken.** The access JWT has a 10-day
   TTL and Hermes refreshes lazily on the next real use; re-login is only
   needed when the refresh chain itself is revoked.
+- **Claude (claude-cli provider) reads the claude CLI's own auth, never
+  refreshes it.** Usage counts come from the Hermes state DBs
+  (`billing_provider LIKE 'claude-subscription%'` — the
+  claude-subscription-directsdk plugin spawns the official `claude` CLI as
+  a subprocess, and those sessions land under that provider id; the STOCK
+  omarchy-agent-usage-claude collector can't see them because it counts
+  `~/.claude/projects` transcripts, which the plugin's headless `-p`
+  subprocesses never write — so we ship our own tab instead of enabling
+  the stock one). Live limits are a READ-ONLY GET on
+  `https://api.anthropic.com/api/oauth/usage` with the access token from
+  `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`, headers
+  mirror the stock collector: `anthropic-beta: oauth-2025-04-20`). The
+  claude CLI owns that credential file and rewrites it on its own runs;
+  the collector never rotates the token (same rule as the Nous and
+  openai-codex chains). The payload's percent-scale convention is
+  inferred (any utilization ≥ 1 means percent); `five_hour`/`seven_day`
+  (or `seven_day_oauth_apps`) become Session/Weekly meters, scoped
+  `weekly_scoped` entries become titled meters ("Fable Weekly"), and the
+  `extra_usage` credits spend cap (EUR on this account) gets its own
+  meter so the panel tracks it before it locks the account. Provider id
+  is `claude-cli` (NOT `claude`) so the stock collector, when enabled,
+  never races this one writing `usage/claude.json`; the stale stock
+  record was removed and `claude` stays disabled in the bar config.
 - **Transient network failures never blank the panel.** A limits fetch that
   fails on DNS/connection/timeout gets one retry after 5s (covers the timer
   run racing system DNS at boot); if it still fails, the last good limits
@@ -198,7 +221,7 @@ stock, kept small on purpose:
 - **Model names** render as raw model IDs (stock title-cases them).
 - **Panel width** 480 units instead of 380 — the four-way subscription switch
   needs more room.
-- **SVG marks** for zai, kimi, nous, chatgpt (+ `zai-light.svg`,
+- **SVG marks** for zai, kimi, nous, chatgpt, claude-cli (+ `zai-light.svg`,
   `codex-light.svg` dark-surface variants) in `assets/`.
 
 Full panel documentation: [plugin/PANEL.md](plugin/PANEL.md).

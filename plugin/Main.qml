@@ -43,8 +43,9 @@ Item {
       var name = lines[i].trim()
       if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))
     }
-    // Custom order: zai first, then kimi, then chatgpt, then rest alphabetical
-    var order = ["zai", "kimi", "chatgpt"]
+    // Custom order: zai first, then kimi, then chatgpt, then claude-cli
+    // (claude CLI subscription via the directsdk plugin), then rest alphabetical
+    var order = ["zai", "kimi", "chatgpt", "claude-cli"]
     ids.sort(function(a, b) {
       var ia = order.indexOf(a)
       var ib = order.indexOf(b)
@@ -203,7 +204,7 @@ Item {
   }
 
   function hasHermesProviders(agentIds) {
-    var custom = ["zai", "kimi", "chatgpt", "nous"]
+    var custom = ["zai", "kimi", "chatgpt", "nous", "claude-cli"]
     var ids = agentIds && agentIds.length > 0 ? agentIds : root.agentIds
     for (var i = 0; i < ids.length; i++) {
       if (custom.indexOf(String(ids[i])) !== -1) return true

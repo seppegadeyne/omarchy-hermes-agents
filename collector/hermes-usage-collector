@@ -15,6 +15,7 @@ Live limits:
 
 import base64
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -87,6 +88,21 @@ PROVIDERS = [
         "where": "(smu.billing_provider IN ('openai-codex', 'auto') AND smu.billing_base_url LIKE '%chatgpt.com%') AND (smu.model LIKE '%gpt%' OR smu.model LIKE '%codex%' OR smu.model LIKE 'o1%' OR smu.model LIKE 'o3%' OR smu.model LIKE 'o4%')",
         "params": (),
         "limits_fn": "fetch_chatgpt_limits",
+    },
+    {
+        "id": "claude-cli",
+        "name": "Claude",
+        "tierLabel": "Subscription",
+        "scope": "machine",
+        # Claude subscription usage via the claude-subscription-directsdk
+        # plugin: Hermes spawns the official claude CLI as subprocess, and
+        # those sessions are billed under this provider id in state.db.
+        # The STOCK omarchy-agent-usage-claude collector cannot see them:
+        # it counts ~/.claude/projects transcripts, which the plugin's
+        # headless -p subprocesses never write.
+        "where": "smu.billing_provider LIKE 'claude-subscription%'",
+        "params": (),
+        "limits_fn": "fetch_claude_cli_limits",
     },
 ]
 
@@ -767,11 +783,197 @@ def fetch_chatgpt_limits(auth):
         return [], "", "ChatGPT API unavailable", str(exc)
 
 
+ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
+
+
+def _claude_cli_login():
+    """Read the claude CLI OAuth login (read-only).
+
+    `claude auth login` writes claudeAiOauth into ~/.claude/.credentials.json;
+    only the CLI itself refreshes that token (it rewrites the file whenever
+    it runs). The collector therefore never rotates it — same rule as the
+    Nous and openai-codex chains Hermes owns.
+    """
+    try:
+        data = json.loads(CLAUDE_CREDENTIALS.read_text())
+    except Exception:
+        return {}
+    login = data.get("claudeAiOauth")
+    return login if isinstance(login, dict) else {}
+
+
+def _anthropic_percent(value, percent_scale):
+    """Anthropic reports utilization as a percent (37.0 or 1.0 = 1%)."""
+    try:
+        n = float(str(value).strip().replace("%", ""))
+    except (TypeError, ValueError):
+        return -1.0
+    if not (n >= 0):
+        return -1.0
+    if percent_scale or n > 1:
+        return min(1.0, n / 100.0)
+    return min(1.0, n)
+
+
+def fetch_claude_cli_limits(auth):
+    """READ-ONLY limits fetch from Anthropic's OAuth usage endpoint, using
+    the claude CLI login (this machine's Claude-subscription auth source).
+
+    Endpoint/headers mirror the stock omarchy-agent-usage-claude collector:
+    GET https://api.anthropic.com/api/oauth/usage with Bearer access token
+    and the oauth-2025-04-20 beta header. Session (5-hour) + Weekly (7-day)
+    meters come from five_hour/seven_day (the oauth-apps view when present);
+    scoped per-model windows (e.g. "Fable Weekly") from limits[]; and the
+    extra-usage credits spend cap (EUR on this account) becomes a meter of
+    its own so the panel tracks it before it locks the account.
+
+    NEVER refresh tokens here: the claude CLI owns that credential file and
+    rewrites it on its own runs. An expired token is surfaced honestly.
+
+    Returns (limits_list, tier_label, status_text, auth_help).
+    """
+    login = _claude_cli_login()
+    access_token = login.get("accessToken") or ""
+    if not access_token:
+        return [], "", "Claude CLI not logged in", "Run `claude auth login`"
+
+    expires_at = login.get("expiresAt") or 0
+    try:
+        expires_at = float(expires_at)
+        if expires_at > 1e12:
+            expires_at /= 1000.0
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at and expires_at <= time.time():
+        return [], "", "Claude sign-in expired", "Start the claude CLI, or run `claude auth login`, to refresh it"
+
+    req = urllib.request.Request(
+        ANTHROPIC_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return [], "", "Claude token rejected", "Run `claude auth login`"
+        if exc.code == 429:
+            return [], "", "Anthropic usage endpoint rate limiting checks", ""
+        return [], "", f"Anthropic API error ({exc.code})", ""
+    except Exception as exc:
+        # Transient marker word keeps the panel's retryAdvised 30s retry.
+        return [], "", "Anthropic API unavailable", str(exc)
+
+    def _bucket(payload, key):
+        value = payload.get(key)
+        if isinstance(value, dict) and value.get("utilization") is not None:
+            return value
+        return None
+
+    session = _bucket(payload, "five_hour")
+    weekly = _bucket(payload, "seven_day_oauth_apps") or _bucket(payload, "seven_day")
+
+    # One payload speaks one convention; any value >= 1 means percent scale.
+    raw = []
+    if session:
+        raw.append(session.get("utilization"))
+    if weekly:
+        raw.append(weekly.get("utilization"))
+    entries = payload.get("limits")
+    if isinstance(entries, list):
+        raw += [e.get("percent") for e in entries if isinstance(e, dict)]
+    numbers = []
+    for v in raw:
+        try:
+            numbers.append(float(str(v).strip().replace("%", "")))
+        except (TypeError, ValueError):
+            pass
+    percent_scale = any(n >= 1 for n in numbers)
+
+    def _resets_iso(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
+        except Exception:
+            return raw
+
+    limits = []
+    if session is not None:
+        percent = _anthropic_percent(session.get("utilization"), percent_scale)
+        if percent >= 0:
+            limits.append({
+                "label": "Session (5-hour)",
+                "percent": percent,
+                "resetsAt": _resets_iso(session.get("resets_at")),
+            })
+    if weekly is not None:
+        percent = _anthropic_percent(weekly.get("utilization"), percent_scale)
+        if percent >= 0:
+            limits.append({
+                "label": "Weekly (7-day)",
+                "percent": percent,
+                "resetsAt": _resets_iso(weekly.get("resets_at")),
+            })
+
+    # Scoped per-model weekly windows (e.g. Fable) — free-floating titles.
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+                continue
+            percent = _anthropic_percent(entry.get("percent"), percent_scale)
+            if percent < 0:
+                continue
+            scope = entry.get("scope")
+            model = scope.get("model", {}) if isinstance(scope, dict) else {}
+            name = str(model.get("display_name") or model.get("id") or "").strip()
+            if not name:
+                continue
+            title = f"{name} Weekly"
+            limits.append({
+                "label": title,
+                "title": title,
+                "percent": percent,
+                "resetsAt": _resets_iso(entry.get("resets_at")),
+            })
+
+    # Extra usage credits (purchased overage, e.g. EUR spend cap). This is
+    # the meter that locks the account when it fills — surface it so the
+    # panel tracks it before it does.
+    extra = payload.get("extra_usage")
+    if isinstance(extra, dict) and extra.get("is_enabled"):
+        try:
+            used = float(extra.get("used_credits") or 0)
+            cap = float(extra.get("monthly_limit") or 0)
+        except (TypeError, ValueError):
+            used, cap = 0.0, 0.0
+        if cap > 0:
+            currency = str(extra.get("currency") or "")
+            limits.append({
+                "label": f"Extra credits ({used:.0f}/{cap:.0f} {currency})",
+                "percent": min(max(used / cap, 0.0), 1.0),
+                "resetsAt": "",
+            })
+
+    tier_label = ""
+    subscription = str(login.get("subscriptionType") or "")
+    if subscription:
+        tier_label = subscription[0].upper() + subscription[1:]
+    return limits, tier_label, "", ""
+
+
 LIMIT_FETCHERS = {
     "fetch_kimi_limits": fetch_kimi_limits,
     "fetch_nous_limits": fetch_nous_limits,
     "fetch_zai_limits": fetch_zai_limits,
     "fetch_chatgpt_limits": fetch_chatgpt_limits,
+    "fetch_claude_cli_limits": fetch_claude_cli_limits,
 }
 
 
