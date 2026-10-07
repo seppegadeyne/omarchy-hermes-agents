@@ -743,12 +743,15 @@ def fetch_chatgpt_limits(auth):
         return [], "", f"ChatGPT API error ({last_error.code})", "" if last_error else ""
 
     try:
-        plan = payload.get("plan_type") or ""
+        plan = str(payload.get("plan_type") or "").strip()
         tier_label = plan.capitalize() if plan else ""
 
         rate_limit = payload.get("rate_limit") or {}
         limits = []
 
+        # Free plan reports a 30-day window (2592000s) with no secondary
+        # window; the label logic below derives "Monthly (30-day)" from the
+        # span so it sorts into the panel's Monthly bucket.
         for key, label in (("primary_window", "Weekly (7-day)"), ("secondary_window", "Secondary")):
             window = rate_limit.get(key)
             if not isinstance(window, dict):
@@ -759,7 +762,12 @@ def fetch_chatgpt_limits(auth):
             window_seconds = int(window.get("limit_window_seconds") or 0)
             if window_seconds:
                 hours = window_seconds // 3600
-                if hours >= 168:
+                if hours >= 672:
+                    # 28 days or more: free plans report a 30-day window
+                    # (2592000s). Panel.qml buckets "month"/"30-day" labels
+                    # as Monthly with a 30d span.
+                    label = "Monthly (30-day)"
+                elif hours >= 168:
                     label = "Weekly (7-day)"
                 elif hours > 0:
                     label = f"{hours}h window"
@@ -777,6 +785,26 @@ def fetch_chatgpt_limits(auth):
                 "percent": float(used) / 100.0,
                 "resetsAt": resets_iso,
             })
+
+        # Free plans carry a credit balance (non-USD unit: ~62k for a small
+        # allowance). There is no cap to draw a meter from, so surface it as
+        # an info row: percent -1 renders as "—" with no meter fill, and the
+        # windowTitle fallback names it from the label.
+        credits = payload.get("credits") or {}
+        if credits.get("has_credits"):
+            try:
+                balance = float(credits.get("balance") or 0)
+            except (TypeError, ValueError):
+                balance = 0.0
+            if balance > 0:
+                limits.append({
+                    "label": f"Credits ({balance:,.0f})",
+                    # Explicit title: windowTitle strips parenthesised suffixes,
+                    # which would hide the balance behind the "—" value slot.
+                    "title": f"Credits ({balance:,.0f})",
+                    "percent": -1,
+                    "resetsAt": "",
+                })
 
         return limits, tier_label, "", ""
     except Exception as exc:

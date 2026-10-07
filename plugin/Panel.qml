@@ -122,7 +122,10 @@ Panel {
     for (var i = 0; i < list.length; i++) {
       var entry = list[i] || {}
       var percent = Number(entry.percent)
-      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
+      // percent >= 0 meters the window; -1 is the info-row sentinel (e.g. a
+      // credit balance with no cap): rendered as "—" with no meter, and it
+      // can never win bindingWindow since that picks the max percent.
+      if (percent >= -1) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
     }
     return out
   }
@@ -769,6 +772,8 @@ Panel {
     }
 
     Meter {
+      // Info rows (percent -1) have no cap to meter — label + "—" only.
+      visible: limitRow.window && limitRow.window.percent >= 0
       width: parent.width
       value: limitRow.window ? limitRow.window.percent : -1
       alarming: limitRow.alarming

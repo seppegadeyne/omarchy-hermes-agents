@@ -110,6 +110,26 @@ Deliberate safety rules learned the hard way (documented inline):
 - **ChatGPT 401 = idle-expired, not broken.** The access JWT has a 10-day
   TTL and Hermes refreshes lazily on the next real use; re-login is only
   needed when the refresh chain itself is revoked.
+- **Free plan payload differs from paid plans (handled 2026-10-07).** After
+  downgrading ChatGPT to free, every stored access token was 401'd
+  server-side (plan switch invalidates sessions even mid-JWT) and the
+  wham/usage payload changed shape: `plan_type: "free"`, a single
+  `primary_window` of 2592000s (30 days) — which the old ≥168h branch
+  mislabeled "Weekly (7-day)" — plus a `credits` object with a balance
+  (~62k, unitless) and no cap. Recovery: two one-shot
+  `hermes --provider openai-codex --model <supported>` calls let Hermes'
+  own auth layer rotate the chain (never refresh from the collector), then
+  the collector maps ≥672h windows to "Monthly (30-day)" (Panel.qml's
+  windowTitle buckets month/30-day labels as Monthly) and renders the
+  credit balance as an info row (`percent: -1`, explicit `title` carrying
+  the amount — windowTitle strips parenthesised suffixes, so without a
+  title the balance would hide behind the "—" value slot). Panel.qml
+  accepts `percent >= -1` in `limitWindows()` (−1 = no meter, "—" value,
+  can never win bindingWindow) and hides the Meter bar for info rows.
+  Free-plan Codex model support is thin: `gpt-5.5` and `gpt-5.6-luna`
+  work, `gpt-5.5-mini`/`gpt-5.6-sol`/`gpt-5.3-codex` return
+  400 "model is not supported when using Codex with a ChatGPT account"
+  (that 400 also doubles as an auth-OK probe: it proves the token works).
 - **Claude (claude-cli provider) reads the claude CLI's own auth, never
   refreshes it.** Usage counts come from the Hermes state DBs
   (`billing_provider LIKE 'claude-subscription%'` — the
