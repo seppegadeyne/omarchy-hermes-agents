@@ -43,9 +43,9 @@ Item {
       var name = lines[i].trim()
       if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))
     }
-    // Custom order: zai first, then kimi, then chatgpt, then claude-cli
-    // (claude CLI subscription via the directsdk plugin), then rest alphabetical
-    var order = ["zai", "kimi", "chatgpt", "claude-cli"]
+    // Custom order: zai first, then claude-cli (claude CLI subscription via
+    // the directsdk plugin), then kimi, then chatgpt last, then rest alphabetical
+    var order = ["zai", "claude-cli", "kimi", "chatgpt"]
     ids.sort(function(a, b) {
       var ia = order.indexOf(a)
       var ib = order.indexOf(b)
