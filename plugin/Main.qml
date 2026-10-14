@@ -43,9 +43,9 @@ Item {
       var name = lines[i].trim()
       if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))
     }
-    // Custom order: zai first, then claude-cli (claude CLI subscription via
-    // the directsdk plugin), then kimi, then chatgpt last, then rest alphabetical
-    var order = ["zai", "claude-cli", "kimi", "chatgpt"]
+    // Custom order: claude-cli first (claude CLI subscription via the
+    // directsdk plugin), then chatgpt, then rest alphabetical
+    var order = ["claude-cli", "chatgpt"]
     ids.sort(function(a, b) {
       var ia = order.indexOf(a)
       var ib = order.indexOf(b)
@@ -179,7 +179,7 @@ Item {
   }
 
   // The stock orchestrator only reaches built-in collectors. Hermes-managed
-  // providers (zai, kimi, chatgpt, nous) come from hermes-usage-collector,
+  // providers (claude-cli, chatgpt) come from hermes-usage-collector,
   // which speaks the same flag convention (--force/--limits-only/--except/
   // ids); run it alongside so panel-triggered refreshes and the 30s
   // retryAdvised retry cover custom providers too.
@@ -204,7 +204,7 @@ Item {
   }
 
   function hasHermesProviders(agentIds) {
-    var custom = ["zai", "kimi", "chatgpt", "nous", "claude-cli"]
+    var custom = ["claude-cli", "chatgpt"]
     var ids = agentIds && agentIds.length > 0 ? agentIds : root.agentIds
     for (var i = 0; i < ids.length; i++) {
       if (custom.indexOf(String(ids[i])) !== -1) return true
