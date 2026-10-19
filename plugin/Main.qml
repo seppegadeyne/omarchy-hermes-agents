@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.Commons
 
 // The display side of agent usage. All extraction lives behind
 // omarchy-agent-usage-update, which writes one JSON record per agent into
@@ -43,17 +44,7 @@ Item {
       var name = lines[i].trim()
       if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))
     }
-    // Custom order: claude-cli first (claude CLI subscription via the
-    // directsdk plugin), then chatgpt, then rest alphabetical
-    var order = ["claude-cli", "chatgpt"]
-    ids.sort(function(a, b) {
-      var ia = order.indexOf(a)
-      var ib = order.indexOf(b)
-      if (ia !== -1 && ib !== -1) return ia - ib
-      if (ia !== -1) return -1
-      if (ib !== -1) return 1
-      return a < b ? -1 : a > b ? 1 : 0
-    })
+    ids.sort()
     // Same list, same objects: reassigning the model would tear down every
     // FileView just to build identical ones.
     if (JSON.stringify(ids) !== JSON.stringify(agentIds)) agentIds = ids
@@ -72,6 +63,13 @@ Item {
 
     onObjectAdded: (index, object) => root.rebuildAgents()
     onObjectRemoved: (index, object) => root.rebuildAgents()
+  }
+
+  // Each record's FileView follows its file on its own; this catches the ones
+  // whose watch was lost when an update replaced the file underneath them.
+  function reloadRecords() {
+    for (var i = 0; i < agents.length; i++)
+      if (agents[i]) agents[i].reload()
   }
 
   function rebuildAgents() {
@@ -127,12 +125,32 @@ Item {
   property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
   property string pendingUpdateKind: ""
 
+  // A fifteen-minute interval can't catch an account crossing its switch
+  // threshold, so while any provider with several accounts has its active one
+  // within 15 points of that threshold (80% at the default 95%), the limits
+  // are checked every three minutes. Those runs
+  // reuse the transcript scans; only the limits probes are new, and any more
+  // often than this Anthropic starts refusing them.
+  readonly property bool nearLimit: {
+    var rev = dataRevision
+    for (var i = 0; i < agents.length; i++) {
+      var record = agents[i] ? agents[i].record : null
+      if (!record || !Array.isArray(record.accounts) || record.accounts.length < 2) continue
+      var limits = Array.isArray(record.limits) ? record.limits : []
+      var threshold = Number(record.accountSwitch && record.accountSwitch.threshold || 95)
+      var from = Math.min(0.8, (threshold - 15) / 100)
+      for (var j = 0; j < limits.length; j++)
+        if (Number(limits[j] && limits[j].percent) >= from) return true
+    }
+    return false
+  }
+
   Timer {
-    interval: root.refreshIntervalSec * 1000
+    interval: root.nearLimit ? Math.min(180, root.refreshIntervalSec) * 1000 : root.refreshIntervalSec * 1000
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.runUpdate("normal")
+    onTriggered: root.runUpdate(root.nearLimit ? "limits" : "normal")
   }
 
   Process {
@@ -140,6 +158,7 @@ Item {
     running: false
     onExited: {
       root.rescanAgents()
+      root.reloadRecords()
       if (root.pendingUpdateKind !== "") {
         var kind = root.pendingUpdateKind
         root.pendingUpdateKind = ""
@@ -153,15 +172,52 @@ Item {
     }
   }
 
+  // Hermes-managed providers (claude-cli, chatgpt) come from
+  // hermes-usage-collector, which the stock orchestrator never runs. It
+  // speaks the same flags, so panel refreshes and the 30s retry reach it.
+  readonly property var hermesProviderIds: ["claude-cli", "chatgpt"]
+  readonly property string hermesCollectorBin: root.home !== "" ? root.home + "/.local/bin/hermes-usage-collector" : ""
+
   Process {
     id: hermesProcess
     running: false
-    onExited: root.rescanAgents()
+    onExited: {
+      root.rescanAgents()
+      root.reloadRecords()
+    }
 
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("agents-hermes", text.trim())
+      onStreamFinished: if (text.trim() !== "") console.warn("agents-hermes", text.trim().slice(0, 2000))
     }
+  }
+
+  function hermesCollectorCommand(kind, agentIds) {
+    var command = [hermesCollectorBin]
+    if (kind === "force") command.push("--force")
+    if (kind === "limits") command.push("--limits-only")
+    var providers = settings && settings.providers ? settings.providers : {}
+    for (var id in providers) {
+      if (providers[id] && providers[id].enabled === false && /^[a-z0-9][a-z0-9-]*$/.test(id)) command.push("--except", id)
+    }
+    if (agentIds) {
+      for (var i = 0; i < agentIds.length; i++)
+        if (/^[a-z0-9][a-z0-9-]*$/.test(String(agentIds[i]))) command.push(String(agentIds[i]))
+    }
+    return command
+  }
+
+  function hasHermesProviders(agentIds) {
+    var ids = agentIds && agentIds.length > 0 ? agentIds : root.agentIds
+    for (var i = 0; i < ids.length; i++)
+      if (hermesProviderIds.indexOf(String(ids[i])) !== -1) return true
+    return false
+  }
+
+  function runHermesCollector(kind, agentIds) {
+    if (hermesCollectorBin === "" || hermesProcess.running || !hasHermesProviders(agentIds)) return
+    hermesProcess.command = hermesCollectorCommand(kind, agentIds)
+    hermesProcess.running = true
   }
 
   function updateCommand(kind, agentIds) {
@@ -178,40 +234,6 @@ Item {
     return command
   }
 
-  // The stock orchestrator only reaches built-in collectors. Hermes-managed
-  // providers (claude-cli, chatgpt) come from hermes-usage-collector,
-  // which speaks the same flag convention (--force/--limits-only/--except/
-  // ids); run it alongside so panel-triggered refreshes and the 30s
-  // retryAdvised retry cover custom providers too.
-  property string hermesCollectorBin: {
-    var bin = Quickshell.env("HERMES_USAGE_COLLECTOR")
-    if (bin) return bin
-    var home = root.home
-    return home ? home + "/.local/bin/hermes-usage-collector" : ""
-  }
-
-  function hermesCollectorCommand(kind, agentIds) {
-    var command = [hermesCollectorBin]
-    if (kind === "limits") command.push("--limits-only")
-    var providers = settings && settings.providers ? settings.providers : {}
-    for (var id in providers) {
-      if (providers[id] && providers[id].enabled === false) command.push("--except", id)
-    }
-    if (agentIds) {
-      for (var i = 0; i < agentIds.length; i++) command.push(agentIds[i])
-    }
-    return command
-  }
-
-  function hasHermesProviders(agentIds) {
-    var custom = ["claude-cli", "chatgpt"]
-    var ids = agentIds && agentIds.length > 0 ? agentIds : root.agentIds
-    for (var i = 0; i < ids.length; i++) {
-      if (custom.indexOf(String(ids[i])) !== -1) return true
-    }
-    return false
-  }
-
   function runUpdate(kind, agentIds) {
     if (updateProcess.running) {
       // Collapse queued requests to one full rerun; a forced refresh outranks
@@ -221,12 +243,7 @@ Item {
     }
     updateProcess.command = updateCommand(kind, agentIds)
     updateProcess.running = true
-    // Custom Hermes providers refresh in parallel, but only when the panel
-    // actually shows any (record on disk = collector installed).
-    if (hermesCollectorBin !== "" && hasHermesProviders(agentIds)) {
-      hermesProcess.command = hermesCollectorCommand(kind, agentIds)
-      hermesProcess.running = true
-    }
+    runHermesCollector(kind, agentIds)
   }
 
   function refresh() { refreshAll(true) }
@@ -267,7 +284,52 @@ Item {
       var syncedDisplay = displayProvider({ id: syncedId, name: stats.providerName || syncedId })
       if (providerHasData(syncedDisplay)) result.push(syncedDisplay)
     }
-    return result
+    return orderedProviders(result)
+  }
+
+  // ----------------------------------------------------------------- order
+  //
+  // The panel's agents in the order someone dragged them into, kept beside the
+  // usage records. An agent the order doesn't name yet keeps its place after
+  // the ones it does.
+  readonly property string orderPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/order.json"
+  property var providerOrder: []
+
+  function orderedProviders(list) {
+    var order = providerOrder
+    var rank = function(p) {
+      var i = order.indexOf(p.providerId)
+      return i < 0 ? order.length : i
+    }
+    return list.slice().sort(function(a, b) { return rank(a) - rank(b) })
+  }
+
+  // Moves one agent to a position among the ones shown, and saves the result.
+  function moveProvider(id, to) {
+    var ids = enabledProviders.map(function(p) { return p.providerId })
+    var from = ids.indexOf(id)
+    if (from < 0) return
+    to = Math.max(0, Math.min(ids.length - 1, to))
+    if (from === to) return
+    ids.splice(to, 0, ids.splice(from, 1)[0])
+    for (var i = 0; i < providerOrder.length; i++)
+      if (ids.indexOf(providerOrder[i]) < 0) ids.push(providerOrder[i])
+    providerOrder = ids
+    orderFile.setText(JSON.stringify(ids) + "\n")
+  }
+
+  FileView {
+    id: orderFile
+    path: root.orderPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      var parsed = []
+      try { parsed = JSON.parse(text()) } catch (e) { parsed = [] }
+      root.providerOrder = Array.isArray(parsed) ? parsed.map(String) : []
+    }
+    onFileChanged: reload()
   }
 
   function providerEnabled(id) {
@@ -276,12 +338,15 @@ Item {
   }
 
   // All-time keeps a quiet day from hiding an agent; today's counts admit a
-  // machine whose only source is history.jsonl, which knows nothing older.
+  // machine whose only source is history.jsonl, which knows nothing older. A
+  // signed-in agent with a plan shows before its first numbers arrive, so a
+  // lapsed sign-in still has somewhere to say so.
   function providerHasData(p) {
     return numberValue(p.totalPrompts) > 0 || numberValue(p.totalSessions) > 0
       || numberValue(p.activeDays) > 0 || numberValue(p.todayPrompts) > 0
       || numberValue(p.todaySessions) > 0 || (p.limits && p.limits.length > 0)
-      || !!p.balance
+      || (p.accounts && p.accounts.length > 0) || !!p.balance
+      || (p.ready === true && p.tierLabel !== "")
   }
 
   // A prepaid agent's credit ledger. Like rate limits, the balance is
@@ -315,7 +380,14 @@ Item {
       // Rate limits and balances stay per-account and are never merged
       // across devices.
       limits: Array.isArray(record.limits) ? record.limits : [],
+      limitsStale: record.limitsStale === true,
+      limitsFetchedAt: numberValue(record.limitsFetchedAt),
       tierLabel: String(record.tierLabel || ""),
+      // Every subscription account's own limits, once there's more than one.
+      accounts: Array.isArray(record.accounts) ? record.accounts : [],
+      accountSwitch: record.accountSwitch || ({ mode: "manual", threshold: 95 }),
+      // Codex's free full resets of its rate limits, when it has any.
+      resetCredits: record.resetCredits || null,
       balance: balanceValue(record.balance),
 
       todayPrompts: synced ? numberValue(stats.todayPrompts) : numberValue(record.todayPrompts),
@@ -378,7 +450,7 @@ Item {
     onRunningChanged: root.updateSyncRunning()
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        if (root.syncConfigured()) root.syncStatusText = "Usage sync mkdir failed"
+        if (root.syncConfigured()) root.syncStatusText = I18n.t("agents.syncMkdirFailed")
         root.finishSyncRun()
         return
       }
@@ -391,7 +463,7 @@ Item {
     running: false
     onRunningChanged: root.updateSyncRunning()
     onExited: function(exitCode) {
-      if (exitCode !== 0 && root.syncConfigured()) root.syncStatusText = "Usage sync scan failed"
+      if (exitCode !== 0 && root.syncConfigured()) root.syncStatusText = I18n.t("agents.syncScanFailed")
       root.finishSyncRun()
     }
 
@@ -768,16 +840,42 @@ Item {
   // ---------------------------------------------------------------- format
 
   function formatTokenCount(n) {
-    if (n === undefined || n === null) return "0"
-    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K"
-    return String(n)
+    if (n === undefined || n === null) return I18n.formatNumber(0)
+    if (n >= 1e9) return I18n.formatNumber(n / 1e9, 1) + "B"
+    if (n >= 1e6) return I18n.formatNumber(n / 1e6, 1) + "M"
+    if (n >= 1e3) return I18n.formatNumber(n / 1e3, 1) + "K"
+    return I18n.formatNumber(n)
   }
 
-  // Show raw model IDs without title-case transformation.
+  function modelWordCase(word) {
+    if (word === "gpt") return "GPT"
+    if (word === "deepseek") return "DeepSeek"
+    return word.charAt(0).toUpperCase() + word.slice(1)
+  }
+
+  // Model ids arrive hyphenated with the version split across segments
+  // (`claude-opus-4-8`, `gpt-5.6-sol`). Rejoin the numeric run into one
+  // version and title-case the words around it.
   function friendlyModelName(id) {
-    if (!id) return "Unknown"
-    return String(id).replace(/^claude-/, "").replace(/-\d{8}$/, "")
+    if (!id) return I18n.t("agents.unknownModel")
+    var name = String(id).replace(/^claude-/, "").replace(/-\d{8}$/, "")
+    var parts = name.split("-")
+    var words = []
+    var version = []
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i]
+      if (part === "") continue
+      if (/^\d/.test(part)) {
+        version.push(part)
+        continue
+      }
+      if (version.length > 0) {
+        words.push(version.join("."))
+        version = []
+      }
+      words.push(modelWordCase(part))
+    }
+    if (version.length > 0) words.push(version.join("."))
+    return words.length > 0 ? words.join(" ") : I18n.t("agents.unknownModel")
   }
 }

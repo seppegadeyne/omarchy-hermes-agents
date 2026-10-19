@@ -171,7 +171,7 @@ mkdir -p ~/.config/omarchy/plugins/<user>.agents/assets
 cp plugin/assets/*.svg ~/.config/omarchy/plugins/<user>.agents/assets/
 
 # 4. Refresh the panel
-omarchy-shell omarchy.agents refresh
+omarchy-shell seppe.agents refresh
 ```
 
 Verify:
@@ -214,18 +214,36 @@ panel for one sooner retry when the limits endpoint was unreachable.
 
 ## Widget clone: local patches vs stock
 
-`plugin/` is a clone of Omarchy's `omarchy.agents` (MIT). Differences from
-stock, kept small on purpose:
+`plugin/` is generated from the installed stock `omarchy.agents` (MIT) by
+`scripts/port_from_stock.py`, which applies a small, exact-match patch set.
+After an Omarchy update that changes the stock widget, re-port instead of
+hand-merging:
 
-- **Launch action** runs the Hermes TUI (`omarchy-launch-tui --app-id=org.omarchy.agent
-  hermes chat --tui --yolo`) instead of the generic agent picker.
-- **Tab order** patched in `Main.qml`: `claude-cli` first, then `chatgpt`,
-  then alphabetical; stock sorts alphabetically.
-- **Model names** render as raw model IDs (stock title-cases them).
-- **Panel width** 480 units instead of 380 — the four-way subscription switch
-  needs more room.
-- **SVG marks** for chatgpt and claude-cli (plus the stock claude, codex,
-  fireworks marks and `codex-light.svg`) in `assets/`.
+```bash
+python3 scripts/port_from_stock.py ~/.cache/agents-port
+cp ~/.cache/agents-port/{Panel,Main,Agent}.qml ~/.config/omarchy/plugins/seppe.agents/
+omarchy-restart-shell   # hot-reload can keep serving the old document
+```
+
+A patch that no longer matches aborts the port rather than writing a
+half-patched widget. Current patch set (stock r7052, 2026-10-19):
+
+- **IPC target** `seppe.agents`, so `omarchy-shell seppe.agents refresh`
+  reaches the clone and not a stock instance.
+- **Hermes collector** runs alongside `omarchy-agent-usage-update` on every
+  panel refresh / retryAdvised retry (`~/.local/bin/hermes-usage-collector`,
+  fixed path; ids are validated before they reach argv).
+- **Info rows**: a limit with `percent: -1` (ChatGPT credits) renders as a
+  label without meter and never drives the alarm.
+- **Pool-aware alarm**: the bar icon follows the roomiest key pool (title
+  prefix before "·") and only turns red when every pool is at 90%.
+- **Launch action** runs the Hermes TUI instead of `omarchy-agent --pick`.
+- **Panel width** 480 instead of 380.
+- **SVG marks** for chatgpt and claude-cli in `assets/`.
+
+Tab order is no longer patched: stock now supports drag/keyboard reordering
+and persists it in `~/.local/state/omarchy/agents/order.json`
+(set to `["claude-cli","chatgpt"]`). Model names use stock's friendly names.
 
 Full panel documentation: [plugin/PANEL.md](plugin/PANEL.md).
 
