@@ -71,6 +71,8 @@ Deliberate safety rules learned the hard way (documented inline):
   and rotate on every refresh; the owning client (Hermes' auth layer, the
   claude CLI) owns that rotation. A second refresher races it, replays a
   retired token, and the provider revokes the whole session family.
+  (Asking the owning client to refresh itself, as the claude-cli nudge
+  does, is fine: the collector never touches the token or the file.)
 - **ChatGPT limits fall back to fresh same-account profile tokens.** The
   default profile's openai-codex OAuth chain sits idle when real traffic
   runs from dedicated profiles, so its 10-day access token expires — and
@@ -127,7 +129,20 @@ Deliberate safety rules learned the hard way (documented inline):
   mirror the stock collector: `anthropic-beta: oauth-2025-04-20`). The
   claude CLI owns that credential file and rewrites it on its own runs;
   the collector never rotates the token (same rule as the openai-codex
-  chain). The payload's percent-scale convention is
+  chain). Its access token only lives ~8h and is only refreshed when the
+  CLI runs, so on an idle machine the tab went blank with "Claude sign-in
+  expired" while the login itself was fine. Fix (2026-10-19): when the
+  token expires within 5 min, or the usage endpoint answers 401, the
+  collector lets the CLI refresh ITSELF by spawning one tiny headless turn
+  (`claude -p --model haiku --max-turns 1 --tools "" --no-session-persistence
+  …`, cwd in the state dir). The CLI refreshes under its own
+  `.credentials.lock`, so there is still exactly one rotator. `claude auth
+  status` does NOT refresh — only a real request does (verified on CLI
+  2.1.287). Throttled through `~/.local/state/omarchy/agents/claude-cli-nudge.json`
+  (outside usage/): at most once per 10 min, and after a nudge that did
+  not change the token, once per hour, so a dead login never loops the
+  CLI. Only when the nudge fails does the panel show the re-login text.
+  The payload's percent-scale convention is
   inferred (any utilization ≥ 1 means percent); `five_hour`/`seven_day`
   (or `seven_day_oauth_apps`) become Session/Weekly meters, scoped
   `weekly_scoped` entries become titled meters ("Fable Weekly"), and the

@@ -8,7 +8,8 @@ picks them up automatically.
 
 Live limits:
 - Claude: https://api.anthropic.com/api/oauth/usage with the claude CLI's
-  own OAuth token (read-only, never refreshed).
+  own OAuth token (read-only; when it expires the collector lets the CLI
+  refresh itself with one throttled headless turn).
 - ChatGPT: https://chatgpt.com/backend-api/wham/usage with Hermes-stored tokens.
 """
 
@@ -307,6 +308,82 @@ def _claude_cli_login():
     return login if isinstance(login, dict) else {}
 
 
+CLAUDE_NUDGE_STATE = Path.home() / ".local" / "state" / "omarchy" / "agents" / "claude-cli-nudge.json"
+CLAUDE_NUDGE_MIN_INTERVAL_S = 10 * 60   # never spawn the CLI more often than this
+CLAUDE_NUDGE_FAILED_INTERVAL_S = 60 * 60  # after a nudge that did not refresh
+CLAUDE_NUDGE_EARLY_S = 5 * 60           # nudge when the token expires within this
+CLAUDE_NUDGE_TIMEOUT_S = 90
+
+
+def _claude_expires_at(login):
+    try:
+        expires_at = float(login.get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return expires_at / 1000.0 if expires_at > 1e12 else expires_at
+
+
+def _claude_cli_nudge(reason):
+    """Let the claude CLI refresh its OWN token by running one tiny headless turn.
+
+    The collector still never touches ~/.claude/.credentials.json or the
+    refresh token: the CLI refreshes under its own .credentials.lock, exactly
+    as on a normal run, so there is no second rotator to race the chain.
+    `claude auth status` does NOT refresh; a real `-p` request does (verified
+    with claude 2.1.287). Cost: one haiku turn, no tools, no session file.
+    Throttled via a sidecar state file (outside usage/) so a dead login or a
+    burst of panel refreshes cannot loop the CLI. Returns True if the access
+    token changed.
+    """
+    import shutil
+    import subprocess
+
+    now = time.time()
+    try:
+        state = json.loads(CLAUDE_NUDGE_STATE.read_text())
+    except Exception:
+        state = {}
+    # Back off harder after a nudge that did not refresh (dead login, offline):
+    # retrying every timer run would only spend a CLI turn per run.
+    interval = CLAUDE_NUDGE_MIN_INTERVAL_S if state.get("refreshed", True) else CLAUDE_NUDGE_FAILED_INTERVAL_S
+    if now - float(state.get("lastAttemptAt") or 0) < interval:
+        return False
+
+    claude_bin = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    if not Path(claude_bin).exists():
+        return False
+
+    before = _claude_cli_login().get("accessToken") or ""
+    workdir = CLAUDE_NUDGE_STATE.parent / "claude-cli-nudge"
+    workdir.mkdir(parents=True, exist_ok=True)
+    result = "error"
+    try:
+        proc = subprocess.run(
+            [claude_bin, "-p", "--model", "haiku", "--max-turns", "1", "--tools", "",
+             "--no-session-persistence", "--disable-slash-commands", "--strict-mcp-config",
+             "Reply with: ok"],
+            cwd=str(workdir), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=CLAUDE_NUDGE_TIMEOUT_S,
+        )
+        result = f"rc={proc.returncode}"
+    except subprocess.TimeoutExpired:
+        result = "timeout"
+    except Exception as exc:
+        result = f"error: {exc}"
+    after = _claude_cli_login().get("accessToken") or ""
+    refreshed = bool(after) and after != before
+    state = {"lastAttemptAt": now, "reason": reason, "result": result, "refreshed": refreshed}
+    try:
+        tmp = CLAUDE_NUDGE_STATE.with_name(".claude-cli-nudge.tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(CLAUDE_NUDGE_STATE)
+    except Exception:
+        pass
+    print(f"claude CLI nudge ({reason}): {result}, token {'refreshed' if refreshed else 'unchanged'}",
+          file=sys.stderr)
+    return refreshed
+
+
 def _anthropic_percent(value, percent_scale):
     """Anthropic reports utilization as a percent (37.0 or 1.0 = 1%)."""
     try:
@@ -333,7 +410,10 @@ def fetch_claude_cli_limits(auth):
     its own so the panel tracks it before it locks the account.
 
     NEVER refresh tokens here: the claude CLI owns that credential file and
-    rewrites it on its own runs. An expired token is surfaced honestly.
+    rewrites it on its own runs. When the token is (nearly) expired or gets
+    a 401, the collector asks the CLI to refresh itself via one throttled
+    headless turn (_claude_cli_nudge); only if that fails is the expiry
+    surfaced honestly.
 
     Returns (limits_list, tier_label, status_text, auth_help).
     """
@@ -342,16 +422,34 @@ def fetch_claude_cli_limits(auth):
     if not access_token:
         return [], "", "Claude CLI not logged in", "Run `claude auth login`"
 
-    expires_at = login.get("expiresAt") or 0
-    try:
-        expires_at = float(expires_at)
-        if expires_at > 1e12:
-            expires_at /= 1000.0
-    except (TypeError, ValueError):
-        expires_at = 0
+    expires_at = _claude_expires_at(login)
+    if expires_at and expires_at <= time.time() + CLAUDE_NUDGE_EARLY_S:
+        if _claude_cli_nudge("expired" if expires_at <= time.time() else "expiring"):
+            login = _claude_cli_login()
+            access_token = login.get("accessToken") or ""
+            expires_at = _claude_expires_at(login)
     if expires_at and expires_at <= time.time():
-        return [], "", "Claude sign-in expired", "Start the claude CLI, or run `claude auth login`, to refresh it"
+        return [], "", "Claude sign-in expired", "Run `claude auth login` (automatic CLI refresh failed)"
 
+    try:
+        payload = _claude_usage_request(access_token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and _claude_cli_nudge("401"):
+            try:
+                payload = _claude_usage_request(_claude_cli_login().get("accessToken") or "")
+            except urllib.error.HTTPError as exc2:
+                return _claude_http_error(exc2)
+            except Exception as exc2:
+                return [], "", "Anthropic API unavailable", str(exc2)
+        else:
+            return _claude_http_error(exc)
+    except Exception as exc:
+        # Transient marker word keeps the panel's retryAdvised 30s retry.
+        return [], "", "Anthropic API unavailable", str(exc)
+    return _claude_parse_usage(payload, _claude_cli_login())
+
+
+def _claude_usage_request(access_token):
     req = urllib.request.Request(
         ANTHROPIC_USAGE_URL,
         headers={
@@ -360,25 +458,25 @@ def fetch_claude_cli_limits(auth):
             "Accept": "application/json",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            return [], "", "Claude token rejected", "Run `claude auth login`"
-        if exc.code == 429:
-            retry_after = ""
-            try:
-                retry_after = str(exc.headers.get("retry-after") or "").strip() if exc.headers else ""
-            except Exception:
-                retry_after = ""
-            help_text = f"retry after {retry_after}s" if retry_after.isdigit() else ""
-            return [], "", RATE_LIMITED_STATUS, help_text
-        return [], "", f"Anthropic API error ({exc.code})", ""
-    except Exception as exc:
-        # Transient marker word keeps the panel's retryAdvised 30s retry.
-        return [], "", "Anthropic API unavailable", str(exc)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
 
+
+def _claude_http_error(exc):
+    if exc.code == 401:
+        return [], "", "Claude token rejected", "Run `claude auth login` (automatic CLI refresh failed)"
+    if exc.code == 429:
+        retry_after = ""
+        try:
+            retry_after = str(exc.headers.get("retry-after") or "").strip() if exc.headers else ""
+        except Exception:
+            retry_after = ""
+        help_text = f"retry after {retry_after}s" if retry_after.isdigit() else ""
+        return [], "", RATE_LIMITED_STATUS, help_text
+    return [], "", f"Anthropic API error ({exc.code})", ""
+
+
+def _claude_parse_usage(payload, login):
     def _bucket(payload, key):
         value = payload.get(key)
         if isinstance(value, dict) and value.get("utilization") is not None:
