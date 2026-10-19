@@ -237,7 +237,8 @@ half-patched widget. Current patch set (stock r7052, 2026-10-19):
   label without meter and never drives the alarm.
 - **Pool-aware alarm**: the bar icon follows the roomiest key pool (title
   prefix before "·") and only turns red when every pool is at 90%.
-- **Launch action** runs the Hermes TUI instead of `omarchy-agent --pick`.
+- **Launch action** (right-click) runs the classic Hermes CLI (`hermes --yolo`), not the TUI.
+- **No hero buttons and no "Make something cool" tiles**: hidden and removed from the keyboard walk.
 - **Panel width** 480 instead of 380.
 - **SVG marks** for chatgpt and claude-cli in `assets/`.
 

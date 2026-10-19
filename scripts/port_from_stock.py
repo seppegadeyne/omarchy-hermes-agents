@@ -39,8 +39,36 @@ def patch_panel(t: str) -> str:
             "      if (window && window.percent >= root.alarmThreshold) return true\n", "alarm-use")
 
     t = sub(t, '    if (root.bar) root.bar.run("omarchy-agent --pick")\n',
-            '    if (root.bar) root.bar.run("omarchy-launch-tui --app-id=org.omarchy.agent hermes chat --tui --yolo")\n',
+            '    if (root.bar) root.bar.run("omarchy-launch-tui --app-id=org.omarchy.agent hermes --yolo")\n',
             "launch-hermes")
+
+    # No hero buttons (add subscription / start agent) and no "Make something
+    # cool" starter tiles: drop them from the keyboard walk and hide them.
+    t = sub(t, '    if (addButtonShown) hero.push({ kind: "add", index: 0 })\n'
+               '    if (addStage === "") hero.push({ kind: "launch", index: 0 })\n',
+            '', "keys-hero")
+    t = sub(t, '      if (!blankSlate) {\n'
+               '        var tiles = []\n',
+            '      if (false) {\n'
+               '        var tiles = []\n', "keys-starter")
+    t = sub(t, '                visible: root.addStage === "" || root.addButtonShown\n',
+            '                visible: false\n', "hero-buttons")
+    t = sub(t, '          PanelSeparator {\n'
+               '            visible: root.addStage === "" && !root.blankSlate\n',
+            '          PanelSeparator {\n'
+               '            visible: false\n', "starter-separator")
+    t = sub(t, '          Column {\n'
+               '            visible: root.addStage === "" && !root.blankSlate\n'
+               '            width: parent.width\n'
+               '            spacing: Style.space(12)\n\n'
+               '            PanelSectionHeader {\n'
+               '              text: Commons.I18n.t("agents.makeSomethingCool")\n',
+            '          Column {\n'
+               '            visible: false\n'
+               '            width: parent.width\n'
+               '            spacing: Style.space(12)\n\n'
+               '            PanelSectionHeader {\n'
+               '              text: Commons.I18n.t("agents.makeSomethingCool")\n', "starter-tiles")
 
     # percent -1 is an info row (e.g. a credit balance without a cap).
     t = sub(t, "      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))\n",

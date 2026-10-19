@@ -62,8 +62,6 @@ Panel {
   readonly property var keyRows: {
     var rows = []
     var hero = []
-    if (addButtonShown) hero.push({ kind: "add", index: 0 })
-    if (addStage === "") hero.push({ kind: "launch", index: 0 })
     if (hero.length > 0) rows.push(hero)
     if (picking) {
       var choices = []
@@ -93,7 +91,7 @@ Panel {
           if (row.length > 0) rows.push(row)
         }
       }
-      if (!blankSlate) {
+      if (false) {
         var tiles = []
         for (var j = 0; j < starterPrompts.length; j++) tiles.push({ kind: "starter", index: j })
         rows.push(tiles)
@@ -480,7 +478,7 @@ Panel {
   }
 
   function launchAgent() {
-    if (root.bar) root.bar.run("omarchy-launch-tui --app-id=org.omarchy.agent hermes chat --tui --yolo")
+    if (root.bar) root.bar.run("omarchy-launch-tui --app-id=org.omarchy.agent hermes --yolo")
     root.close()
   }
 
@@ -1083,7 +1081,7 @@ Panel {
             trailingControl: Component {
               Row {
                 spacing: Style.space(6)
-                visible: root.addStage === "" || root.addButtonShown
+                visible: false
 
                 HeroButton {
                   visible: root.addButtonShown
@@ -1127,12 +1125,12 @@ Panel {
 
           // ---------- Make something ----------
           PanelSeparator {
-            visible: root.addStage === "" && !root.blankSlate
+            visible: false
             foreground: root.foreground
           }
 
           Column {
-            visible: root.addStage === "" && !root.blankSlate
+            visible: false
             width: parent.width
             spacing: Style.space(12)
 
