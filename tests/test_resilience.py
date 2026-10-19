@@ -22,6 +22,8 @@ failures = []
 
 # Redirect the cache to a throwaway location for the test run.
 setattr(huc, "LIMITS_CACHE_PATH", Path(tempfile.mkdtemp()) / "limits-cache.json")
+# The probe-reuse window is tested on its own below; off for the older cases.
+huc.LIMITS_MIN_PROBE_INTERVAL_S = 0
 
 GOOD_LIMITS = [{"label": "Weekly (10/100)", "percent": 0.1, "resetsAt": "2026-09-15T00:00:00+00:00"}]
 
@@ -106,6 +108,51 @@ check(lo is False and only == set() and excl == set(), f"parse empty: {lo} {only
 check(huc._retry_advised("ChatGPT usage unavailable", "name resolution"), "transient should advise retry")
 check(not huc._retry_advised("ChatGPT not authenticated", "Run `hermes auth add openai-codex --type oauth`"), "auth error must not advise retry")
 check(not huc._retry_advised("", ""), "success must not advise retry")
+
+# --- probe reuse window: a recent probe is served without a request ---------
+huc.LIMITS_MIN_PROBE_INTERVAL_S = 180
+calls["n"] = 0
+
+def counting_good(auth):
+    calls["n"] += 1
+    return (list(GOOD_LIMITS), "Max", "", "")
+
+
+huc.fetch_limits_resilient("claude-cli", counting_good, {})
+huc.fetch_limits_resilient("claude-cli", counting_good, {})
+check(calls["n"] == 1, f"probe within reuse window hit the endpoint ({calls['n']} calls)")
+huc.fetch_limits_resilient("claude-cli", counting_good, {}, force=True)
+check(calls["n"] == 2, "--force must skip the reuse window")
+
+# --- 429: cooldown, cached limits, no red banner, no hammering ----------------
+huc.LIMITS_MIN_PROBE_INTERVAL_S = 0
+calls["n"] = 0
+
+def rate_limited(auth):
+    calls["n"] += 1
+    return ([], "", huc.RATE_LIMITED_STATUS, "retry after 900s")
+
+
+limits, tier, status, help_ = huc.fetch_limits_resilient("claude-cli", rate_limited, {})
+check(calls["n"] == 1, f"429 retried in-process ({calls['n']} calls)")
+check(limits == GOOD_LIMITS and status == "", f"429 should serve cached limits quietly: {limits} {status!r}")
+check(huc.LAST_FETCH_META["claude-cli"]["stale"] is True, "429 cached limits must be marked stale")
+until = huc._load_limits_cache()["claude-cli"]["rateLimitedUntil"]
+check(until - _time.time() > 850, f"Retry-After 900s not honoured: {until - _time.time():.0f}s")
+limits, tier, status, help_ = huc.fetch_limits_resilient("claude-cli", rate_limited, {}, force=True)
+check(calls["n"] == 1, "probe during cooldown (even --force) must not hit the endpoint")
+check(limits == GOOD_LIMITS, "cooldown should keep serving cached limits")
+check(not huc._retry_advised(status, help_), "429 must not advise the 30s retry")
+
+# 429 without any cached limits: honest status, still no hammering.
+cache = huc._load_limits_cache()
+cache.pop("claude-cli")
+huc._store_cached_limits(cache, "other", {"limits": []})
+calls["n"] = 0
+limits, tier, status, help_ = huc.fetch_limits_resilient("claude-cli", rate_limited, {})
+check(not limits and status == huc.RATE_LIMITED_STATUS, f"no-cache 429 status: {status!r}")
+huc.fetch_limits_resilient("claude-cli", rate_limited, {})
+check(calls["n"] == 1, "no-cache 429 must also cool down")
 
 if failures:
     print("FAIL")

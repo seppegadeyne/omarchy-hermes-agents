@@ -233,6 +233,7 @@ half-patched widget. Current patch set (stock r7052, 2026-10-19):
 - **Hermes collector** runs alongside `omarchy-agent-usage-update` on every
   panel refresh / retryAdvised retry (`~/.local/bin/hermes-usage-collector`,
   fixed path; ids are validated before they reach argv).
+- **429 handling** (collector): probes are reused for 3 min (`--force` skips that), a 429 starts a cooldown of max(Retry-After, 10 min) during which the endpoint is not touched at all, and the last good limits stay visible (marked stale, up to 12h) instead of a red banner.
 - **Info rows**: a limit with `percent: -1` (ChatGPT credits) renders as a
   label without meter and never drives the alarm.
 - **Pool-aware alarm**: the bar icon follows the roomiest key pool (title

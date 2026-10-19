@@ -367,7 +367,13 @@ def fetch_claude_cli_limits(auth):
         if exc.code == 401:
             return [], "", "Claude token rejected", "Run `claude auth login`"
         if exc.code == 429:
-            return [], "", "Anthropic usage endpoint rate limiting checks", ""
+            retry_after = ""
+            try:
+                retry_after = str(exc.headers.get("retry-after") or "").strip() if exc.headers else ""
+            except Exception:
+                retry_after = ""
+            help_text = f"retry after {retry_after}s" if retry_after.isdigit() else ""
+            return [], "", RATE_LIMITED_STATUS, help_text
         return [], "", f"Anthropic API error ({exc.code})", ""
     except Exception as exc:
         # Transient marker word keeps the panel's retryAdvised 30s retry.
@@ -492,6 +498,35 @@ LIMIT_FETCHERS = {
 LIMITS_CACHE_PATH = Path.home() / ".local" / "state" / "omarchy" / "agents" / "limits-cache.json"
 LIMITS_CACHE_MAX_AGE_S = 2 * 60 * 60  # 2h
 
+# Usage endpoints (Anthropic's especially) answer 429 when probed too often.
+# Every timer run, panel open and shell restart used to probe, so a few
+# restarts in a row tripped the limit and blanked the meters. Three rules:
+#   * reuse a probe younger than LIMITS_MIN_PROBE_INTERVAL_S (panel opens and
+#     restarts right after a timer run cost nothing; --force skips this);
+#   * after a 429, stay off the endpoint until Retry-After (at least
+#     RATE_LIMIT_COOLDOWN_S) has passed -- --force does NOT skip this, a
+#     click would only earn another 429;
+#   * while rate limited, keep showing the last good limits (up to
+#     RATE_LIMIT_CACHE_MAX_AGE_S) marked stale instead of a red banner.
+LIMITS_MIN_PROBE_INTERVAL_S = 3 * 60
+RATE_LIMIT_COOLDOWN_S = 10 * 60
+RATE_LIMIT_CACHE_MAX_AGE_S = 12 * 60 * 60
+RATE_LIMITED_STATUS = "Usage endpoint rate limited"
+
+# Per provider: {"stale": bool, "fetchedAt": epoch ms} for the record's
+# limitsStale / limitsFetchedAt fields (the stock panel shows the age).
+LAST_FETCH_META = {}
+
+
+def _is_rate_limited(status_text):
+    return "rate limit" in str(status_text or "").lower()
+
+
+def _retry_after_seconds(auth_help):
+    import re
+    match = re.search(r"retry after (\d+)s", str(auth_help or ""))
+    return int(match.group(1)) if match else 0
+
 
 def _is_transient_fetch_error(status_text, auth_help):
     """True when a fetch failure looks like a transient network problem
@@ -537,26 +572,72 @@ def _store_cached_limits(cache, provider_id, entry):
         pass  # cache is best-effort; never fail the collector over it
 
 
-def fetch_limits_resilient(provider_id, fetcher, auth, allow_retry=True):
-    """Run a limits fetcher with one transient retry and stale-limit caching.
+def _cached_entry(provider_id):
+    entry = _load_limits_cache().get(provider_id)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _serve_cached(provider_id, entry, max_age, live):
+    """Cached limits if fresh enough, else None."""
+    limits = entry.get("limits")
+    stored = float(entry.get("storedAt") or 0)
+    if not (isinstance(limits, list) and limits) or time.time() - stored > max_age:
+        return None
+    LAST_FETCH_META[provider_id] = {"stale": not live, "fetchedAt": int(stored * 1000)}
+    return limits, entry.get("tierLabel") or ""
+
+
+def _remember_success(provider_id, limits, tier_label):
+    now = time.time()
+    _store_cached_limits(
+        _load_limits_cache(),
+        provider_id,
+        {"limits": limits, "tierLabel": tier_label, "storedAt": now},
+    )
+    LAST_FETCH_META[provider_id] = {"stale": False, "fetchedAt": int(now * 1000)}
+
+
+def fetch_limits_resilient(provider_id, fetcher, auth, allow_retry=True, force=False):
+    """Run a limits fetcher with probe throttling, rate-limit cooldown,
+    one transient retry and stale-limit caching.
 
     Returns (limits, tier_label, status_text, auth_help).
     Set allow_retry=False when the caller already has its own retry loop
     (the panel's retryAdvised 30s retry calls us with --limits-only).
     """
+    LAST_FETCH_META.pop(provider_id, None)
+    entry = _cached_entry(provider_id)
+    now = time.time()
+
+    # Still cooling down from a 429: do not touch the endpoint at all.
+    if float(entry.get("rateLimitedUntil") or 0) > now:
+        served = _serve_cached(provider_id, entry, RATE_LIMIT_CACHE_MAX_AGE_S, live=False)
+        if served:
+            return served[0], served[1], "", ""
+        return [], "", RATE_LIMITED_STATUS, "Showing local stats; limits return after the cooldown"
+
+    # A recent probe is still the answer: panel opens and shell restarts
+    # right after a timer run must not each cost a request.
+    if not force:
+        served = _serve_cached(provider_id, entry, LIMITS_MIN_PROBE_INTERVAL_S, live=True)
+        if served:
+            return served[0], served[1], "", ""
+
     limits, tier_label, status_text, auth_help = fetcher(auth)
 
     if limits or not status_text:
-        _store_cached_limits(
-            _load_limits_cache(),
-            provider_id,
-            {
-                "limits": limits,
-                "tierLabel": tier_label,
-                "storedAt": time.time(),
-            },
-        )
+        _remember_success(provider_id, limits, tier_label)
         return limits, tier_label, status_text, auth_help
+
+    if _is_rate_limited(status_text):
+        cooldown = max(RATE_LIMIT_COOLDOWN_S, _retry_after_seconds(auth_help))
+        entry = _cached_entry(provider_id)
+        entry["rateLimitedUntil"] = now + cooldown
+        _store_cached_limits(_load_limits_cache(), provider_id, entry)
+        served = _serve_cached(provider_id, entry, RATE_LIMIT_CACHE_MAX_AGE_S, live=False)
+        if served:
+            return served[0], served[1], "", ""
+        return [], tier_label, status_text, "Showing local stats; limits return after the cooldown"
 
     # Fetch failed: retry once for transient-looking errors (post-boot DNS
     # warmup typically resolves within a few seconds). Skipped when the
@@ -565,29 +646,16 @@ def fetch_limits_resilient(provider_id, fetcher, auth, allow_retry=True):
         time.sleep(5)
         limits, tier_label, status_text, auth_help = fetcher(auth)
         if limits or not status_text:
-            _store_cached_limits(
-                _load_limits_cache(),
-                provider_id,
-                {
-                    "limits": limits,
-                    "tierLabel": tier_label,
-                    "storedAt": time.time(),
-                },
-            )
+            _remember_success(provider_id, limits, tier_label)
             return limits, tier_label, status_text, auth_help
 
     # Still failing: serve cached limits if fresh enough AND the failure is
     # transient (network). Auth errors must surface honestly, not be masked
     # by stale meters.
     if not limits and status_text and _is_transient_fetch_error(status_text, auth_help):
-        cached_entry = _load_limits_cache().get(provider_id)
-        if isinstance(cached_entry, dict):
-            age = time.time() - float(cached_entry.get("storedAt") or 0)
-            cached_limits = cached_entry.get("limits")
-            if age <= LIMITS_CACHE_MAX_AGE_S and isinstance(cached_limits, list) and cached_limits:
-                cached_tier = cached_entry.get("tierLabel") or ""
-                cached_status = f"{status_text} — showing cached limits"
-                return cached_limits, cached_tier, cached_status, auth_help
+        served = _serve_cached(provider_id, _cached_entry(provider_id), LIMITS_CACHE_MAX_AGE_S, live=False)
+        if served:
+            return served[0], served[1], f"{status_text} — showing cached limits", auth_help
 
     return limits, tier_label, status_text, auth_help
 
@@ -695,8 +763,9 @@ def collect_provider(conns, meta, auth):
     limits_fn_name = meta.get("limits_fn")
     if limits_fn_name and limits_fn_name in LIMIT_FETCHERS:
         limits, tier_label, status_text, auth_help = fetch_limits_resilient(
-            meta["id"], LIMIT_FETCHERS[limits_fn_name], auth
+            meta["id"], LIMIT_FETCHERS[limits_fn_name], auth, force=FORCE
         )
+    fetch_meta = LAST_FETCH_META.get(meta["id"], {})
 
     record = {
         "schemaVersion": 1,
@@ -712,6 +781,8 @@ def collect_provider(conns, meta, auth):
         "authHelpText": auth_help,
         "retryAdvised": _retry_advised(status_text, auth_help),
         "limits": limits,
+        "limitsStale": bool(fetch_meta.get("stale")),
+        "limitsFetchedAt": int(fetch_meta.get("fetchedAt") or 0),
         "todayPrompts": today_prompts,
         "todaySessions": len(today_sessions),
         "todayTotalTokens": today_total_tokens,
@@ -751,8 +822,11 @@ def _refresh_limits_only(meta, auth):
     # loop is the retry, so no in-process sleep here.
     limits, tier_label, status_text, auth_help = fetch_limits_resilient(
         meta["id"], LIMIT_FETCHERS[meta["limits_fn"]], auth,
-        allow_retry=False,
+        allow_retry=False, force=FORCE,
     )
+    fetch_meta = LAST_FETCH_META.get(meta["id"], {})
+    record["limitsStale"] = bool(fetch_meta.get("stale"))
+    record["limitsFetchedAt"] = int(fetch_meta.get("fetchedAt") or 0)
     record["updatedAt"] = datetime.now(timezone.utc).isoformat()
     record["tierLabel"] = tier_label or record.get("tierLabel", "")
     record["usageStatusText"] = status_text
@@ -769,6 +843,9 @@ def _refresh_limits_only(meta, auth):
     )
 
 
+FORCE = False
+
+
 def _parse_args(argv):
     """Parse the omarchy-agent-usage-update call convention:
     [--force] [--limits-only] [--except <id>]... [provider-id]...
@@ -781,7 +858,8 @@ def _parse_args(argv):
     while i < len(argv):
         arg = argv[i]
         if arg == "--force":
-            pass  # full run is the default here
+            global FORCE
+            FORCE = True  # skip the probe reuse window (not a 429 cooldown)
         elif arg == "--limits-only":
             limits_only = True
         elif arg == "--except":
