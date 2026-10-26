@@ -104,6 +104,14 @@ def test_cron_window_is_offset_agnostic():
         assert row["value"] == "2/2", row
 
 
+
+def test_ram_and_disk_rows():
+    ram = o.ram_row()
+    assert ram and 0 <= ram["percent"] <= 1 and ram["alarm"] is False, ram
+    disk = o.disk_row(Path("/"))
+    assert disk and disk["value"].endswith(" free") and disk["alarm"] is False, disk
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

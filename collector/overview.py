@@ -462,6 +462,57 @@ def gpu_stats():
         return None
 
 
+def fmt_bytes(n):
+    n = float(n)
+    for unit, size in (("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20)):
+        if n >= size:
+            v = n / size
+            return f"{v:.0f}{unit}" if v >= 100 else f"{v:.1f}{unit}"
+    return f"{n:.0f}B"
+
+
+def ram_row():
+    """RAM in use = MemTotal - MemAvailable (page cache is reclaimable and
+    would otherwise make a 128 GB box look full)."""
+    try:
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, rest = line.split(":", 1)
+            mem[key] = int(rest.split()[0]) * 1024
+        total, avail = mem["MemTotal"], mem["MemAvailable"]
+    except Exception:
+        return None
+    used = total - avail
+    swap_used = mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)
+    detail = (f"{fmt_bytes(used)} of {fmt_bytes(total)} in use · {fmt_bytes(avail)} available\n"
+              f"Page cache {fmt_bytes(mem.get('Cached', 0))} (reclaimable, not counted)")
+    if swap_used > 0:
+        detail += f"\nSwap/zram in use: {fmt_bytes(swap_used)}"
+    return meter("RAM", used / total if total else 0, f"{fmt_bytes(used)}", detail)
+
+
+def disk_row(path=None):
+    """Free space on the SSD that holds the models (~/Models, else $HOME)."""
+    path = path or (Path.home() / "Models")
+    if not Path(path).exists():
+        path = Path.home()
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    if not total:
+        return None
+    used = total - st.f_bfree * st.f_frsize
+    row = meter("SSD", used / total, f"{fmt_bytes(free)} free",
+                f"{fmt_bytes(free)} free of {fmt_bytes(total)} ({used / total:.0%} used)\n"
+                f"Filesystem holding {path}")
+    if free / total < 0.10:
+        row["urgent"] = True
+    return row
+
+
 def energy_today(power_w):
     """Integrate GPU power across collector runs (trapezoid). Sidecar state
     lives outside usage/ (the panel renders every usage/*.json as a tab)."""
@@ -599,6 +650,9 @@ def collect_local(rows, unreadable):
                            f"≈ €{kwh * price:.2f} at €{price:.2f}/kWh (set eurPerKwh in {LOCAL_CONFIG})\n"
                            f"Whole GPU, sampled every collector run since "
                            f"{datetime.fromtimestamp(since).strftime('%H:%M')}"))
+    for row in (ram_row(), disk_row()):
+        if row:
+            limits.append(row)
     limits.append(fast_tier_rows(rows))
 
     rec["limits"] = limits

@@ -1012,7 +1012,7 @@ Panel {
     open: root.opened
     focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(480))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(860))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(1400))
 
     content: PanelKeyCatcher {
       id: keyCatcher

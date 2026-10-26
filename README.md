@@ -72,7 +72,9 @@ entry, so no Panel layout beyond the row patches below was needed.
   today, integrated across collector runs (sidecar
   `agents/local-live-energy.json`, gaps > 20 min skipped, price from
   `~/.config/omarchy/agents/local-live.json` `{"eurPerKwh": 0.30}`); and the
-  fast-tier hit rate: subagent sessions over the last 7 days on a local
+  RAM meter (MemTotal - MemAvailable; page cache not counted, zram in the
+  tooltip), SSD meter for the filesystem holding ~/Models (value = free
+  space, red under 10% free), and the fast-tier hit rate: subagent sessions over the last 7 days on a local
   model vs on haiku.
 
 Mapping is by billing provider / base URL, so anything routed through Hermes
@@ -296,7 +298,8 @@ half-patched widget. Current patch set (re-ported onto the stock update of 2026-
   prefix before "·") and only turns red when every pool is at 90%.
 - **Launch action** (right-click) runs the classic Hermes CLI (`hermes --yolo`), not the TUI.
 - **No hero buttons and no "Make something cool" tiles**: hidden and removed from the keyboard walk.
-- **Panel width** 480 instead of 380.
+- **Panel size** width 480 instead of 380, height cap 1400 instead of 860
+  (still clamped to the screen; scrolls beyond it).
 - **SVG marks** for chatgpt and claude-cli in `assets/`; the port copies
   stock `hermes` -> `hermes-overview` and `ollama` -> `local-live`.
 - **Hermes collector ids** run on panel refresh: claude-cli, chatgpt,

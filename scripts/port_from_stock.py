@@ -191,6 +191,11 @@ def patch_panel(t: str) -> str:
             "      color: compact.urgentRow ? root.urgent : root.dim\n",
             "compact-value")
 
+    # Four tabs with Hermes + Local rows outgrow stock's 860 cap; the panel
+    # still clamps to the available screen height and scrolls beyond it.
+    t = sub(t, "    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(860))\n",
+            "    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(1400))\n",
+            "panel-height")
     t = sub(t, "    contentWidth: panel.fittedContentWidth(Style.space(380))\n",
             "    contentWidth: panel.fittedContentWidth(Style.space(480))\n", "panel-width")
     return t
