@@ -932,7 +932,7 @@ def _refresh_limits_only(meta, auth):
     record["retryAdvised"] = _retry_advised(status_text, auth_help)
     record["limits"] = limits
 
-    tmp_path = USAGE_DIR / f".{meta['id']}.tmp"
+    tmp_path = USAGE_DIR / f".{meta['id']}.{os.getpid()}.tmp"
     tmp_path.write_text(json.dumps(record, indent=2) + "\n")
     tmp_path.replace(out_path)
     print(
@@ -992,7 +992,7 @@ def main():
                 continue
             record = collect_provider(conns, meta, auth)
             out_path = USAGE_DIR / f"{meta['id']}.json"
-            tmp_path = USAGE_DIR / f".{meta['id']}.tmp"
+            tmp_path = USAGE_DIR / f".{meta['id']}.{os.getpid()}.tmp"
             tmp_path.write_text(json.dumps(record, indent=2) + "\n")
             tmp_path.replace(out_path)
             print(
@@ -1005,7 +1005,30 @@ def main():
         for conn in conns:
             conn.close()
 
+    # Hermes overview + live local-model records (all local reads, cheap, so
+    # --limits-only refreshes them whole). A failure here never costs the
+    # provider records above.
+    try:
+        _overview_module().run(USAGE_DIR, only_ids, excluded)
+    except Exception as exc:
+        print(f"hermes-usage-collector: overview/local-live failed: {exc!r}", file=sys.stderr)
+
     return 0
+
+
+def _overview_module():
+    """overview.py sits next to this script in the repo and is deployed to
+    ~/.local/lib/hermes-usage-collector/ (a bin dir is no place for modules)."""
+    import importlib.util
+    here = Path(os.path.realpath(__file__)).parent
+    for cand in (here / "overview.py",
+                 Path.home() / ".local" / "lib" / "hermes-usage-collector" / "overview.py"):
+        if cand.exists():
+            spec = importlib.util.spec_from_file_location("hermes_usage_overview", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise FileNotFoundError("overview.py not found")
 
 
 if __name__ == "__main__":

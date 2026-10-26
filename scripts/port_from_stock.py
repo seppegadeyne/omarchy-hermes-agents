@@ -139,6 +139,58 @@ def patch_panel(t: str) -> str:
             "      alarming: compact.alarming\n",
             "compact-meter")
 
+    # Row extras for the hermes-overview / local-live records: a short
+    # right-aligned `value` instead of the reset countdown, tooltip `detail`
+    # lines, `urgent` (alarm color) and `alarm: false` (a full VRAM/power
+    # meter is information, not a reason to paint the bar icon red).
+    t = sub(t,
+            "      percent: expired ? 0 : Number(percent),\n"
+            "      resetAt: expired ? \"\" : String(resetAt || \"\")\n"
+            "    }\n",
+            "      percent: expired ? 0 : Number(percent),\n"
+            "      resetAt: expired ? \"\" : String(resetAt || \"\"),\n"
+            "      value: String(extra && extra.value || \"\"),\n"
+            "      detail: String(extra && extra.detail || \"\"),\n"
+            "      urgent: !!(extra && extra.urgent === true),\n"
+            "      alarm: !(extra && extra.alarm === false)\n"
+            "    }\n", "row-extras")
+    t = sub(t, "  function limitWindow(label, percent, resetAt, title) {\n",
+            "  function limitWindow(label, percent, resetAt, title, extra) {\n", "row-extras-sig")
+    t = sub(t, "      if (percent >= -1) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))\n",
+            "      if (percent >= -1) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title, entry))\n",
+            "row-extras-pass")
+    t = sub(t, "      if (w.percent < 0) continue\n",
+            "      if (w.percent < 0 || w.alarm === false) continue\n", "row-no-alarm")
+    t = sub(t, "    readonly property bool alarming: !!window && window.percent >= root.alarmThreshold\n",
+            "    readonly property bool alarming: !!window && window.alarm !== false && window.percent >= root.alarmThreshold\n"
+            "    readonly property bool urgentRow: !!window && window.urgent === true\n",
+            "compact-urgent")
+    t = sub(t,
+            "        if (compact.stale)\n",
+            "        if (compact.window && compact.window.detail) lines.push(compact.window.detail)\n"
+            "        if (compact.stale)\n", "compact-detail")
+    t = sub(t,
+            "      width: parent.width * 0.3\n"
+            "      anchors.verticalCenter: parent.verticalCenter\n"
+            "      text: compact.window ? root.windowDisplayTitle(compact.window.title) : \"\"\n"
+            "      color: root.foreground\n",
+            "      width: compact.info ? parent.width - compactValue.width - Style.space(12) : parent.width * 0.3\n"
+            "      anchors.verticalCenter: parent.verticalCenter\n"
+            "      text: compact.window ? root.windowDisplayTitle(compact.window.title) : \"\"\n"
+            "      color: compact.urgentRow ? root.urgent : root.foreground\n",
+            "compact-title")
+    t = sub(t,
+            "      width: Math.ceil(compactValueMetrics.advanceWidth)\n",
+            "      width: Math.max(Math.ceil(compactValueMetrics.advanceWidth), Math.ceil(implicitWidth))\n",
+            "compact-value-width")
+    t = sub(t,
+            "      text: compact.resetMs > 0 ? root.formatDuration(compact.resetMs) : \"\"\n"
+            "      color: root.dim\n",
+            "      text: compact.window && compact.window.value ? compact.window.value\n"
+            "        : compact.resetMs > 0 ? root.formatDuration(compact.resetMs) : \"\"\n"
+            "      color: compact.urgentRow ? root.urgent : root.dim\n",
+            "compact-value")
+
     t = sub(t, "    contentWidth: panel.fittedContentWidth(Style.space(380))\n",
             "    contentWidth: panel.fittedContentWidth(Style.space(480))\n", "panel-width")
     return t
@@ -150,7 +202,7 @@ def patch_main(t: str) -> str:
             "  // Hermes-managed providers (claude-cli, chatgpt) come from\n"
             "  // hermes-usage-collector, which the stock orchestrator never runs. It\n"
             "  // speaks the same flags, so panel refreshes and the 30s retry reach it.\n"
-            "  readonly property var hermesProviderIds: [\"claude-cli\", \"chatgpt\"]\n"
+            "  readonly property var hermesProviderIds: [\"claude-cli\", \"chatgpt\", \"hermes-overview\", \"local-live\"]\n"
             "  readonly property string hermesCollectorBin: root.home !== \"\" ? root.home + \"/.local/bin/hermes-usage-collector\" : \"\"\n"
             "\n"
             "  Process {\n"
@@ -224,6 +276,13 @@ def main() -> int:
     (out / "assets").mkdir(exist_ok=True)
     for svg in (stock / "assets").glob("*.svg"):
         shutil.copyfile(svg, out / "assets" / svg.name)
+    # Marks for our own record ids: the Hermes mark for the overview, the
+    # Ollama llama for local models (neither id ships an asset in stock).
+    for target, source in (("hermes-overview", "hermes"), ("local-live", "ollama")):
+        for suffix in ("", "-light"):
+            src = stock / "assets" / f"{source}{suffix}.svg"
+            if src.exists():
+                shutil.copyfile(src, out / "assets" / f"{target}{suffix}.svg")
     print(f"ported {stock} -> {out}")
     return 0
 

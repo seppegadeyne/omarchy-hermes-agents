@@ -420,9 +420,18 @@ Panel {
     return parts.join(" · ")
   }
 
+  // Only the agents `omarchy-agent-account-add` signs in get the link; any
+  // other agent's sign-in trouble stays text, with its own help to follow.
+  function supportsSignIn(p) {
+    for (var i = 0; i < addProviders.length; i++)
+      if (p && addProviders[i].providerId === p.providerId) return true
+    return false
+  }
+
   // A lapsed or missing sign-in is something you can fix from here; any other
   // trouble is only reported.
   function needsSignIn(item) {
+    if (item && item.providerId && !supportsSignIn(item)) return false
     var status = String(item && item.usageStatusText || "")
     return status === "Sign-in expired" || status === "Waiting for auth"
   }
@@ -439,7 +448,7 @@ Panel {
   // Sign an account that's already here in again, following along in the
   // add view just like adding one.
   function signInAgain(p, account) {
-    if (!p || addStage === "running") return
+    if (!supportsSignIn(p) || addStage === "running") return
     addProvider = p.providerId
     addPrivate = !!account && account.primary !== true
     addStatus = Commons.I18n.t("agents.starting")
@@ -519,13 +528,17 @@ Panel {
   // and that beats reading it back out of the label: a model-scoped limit is
   // titled after its model, and a name like "Opus 5 (1M context)" would parse
   // as a one-minute window.
-  function limitWindow(label, percent, resetAt, title) {
+  function limitWindow(label, percent, resetAt, title, extra) {
     var reset = new Date(String(resetAt || "")).getTime()
     var expired = isFinite(reset) && reset <= root.nowMs
     return {
       title: String(title || "") !== "" ? String(title) : windowTitle(label),
       percent: expired ? 0 : Number(percent),
-      resetAt: expired ? "" : String(resetAt || "")
+      resetAt: expired ? "" : String(resetAt || ""),
+      value: String(extra && extra.value || ""),
+      detail: String(extra && extra.detail || ""),
+      urgent: !!(extra && extra.urgent === true),
+      alarm: !(extra && extra.alarm === false)
     }
   }
 
@@ -538,7 +551,7 @@ Panel {
       var percent = Number(entry.percent)
       // -1 is the info-row sentinel (an uncapped credit balance): shown
       // without a meter, and it never wins bindingWindow.
-      if (percent >= -1) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
+      if (percent >= -1) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title, entry))
     }
     return out
   }
@@ -596,7 +609,7 @@ Panel {
     var poolOrder = []
     for (var i = 0; i < windows.length; i++) {
       var w = windows[i]
-      if (w.percent < 0) continue
+      if (w.percent < 0 || w.alarm === false) continue
       if (!fullest || w.percent > fullest.percent) fullest = w
       var pool = poolNameForTitle(w.title)
       if (!Object.prototype.hasOwnProperty.call(poolWindows, pool)) { poolWindows[pool] = null; poolOrder.push(pool) }
@@ -657,6 +670,7 @@ Panel {
   function statusDisplayText(status) {
     var value = String(status || "")
     if (value === "Balance unavailable") return Commons.I18n.t("agents.balanceUnavailable")
+    if (value === "Out of credits") return Commons.I18n.t("agents.outOfCredits")
     var limits = value.match(/^(.+) limits unavailable$/)
     if (limits) return Commons.I18n.t("agents.providerLimitsUnavailable").arg(limits[1])
     var provider = value.match(/^(.+) unavailable$/)
@@ -953,7 +967,7 @@ Panel {
     id: phraseSwap
     PropertyAnimation {
       target: hero; property: "metaOpacity"
-      to: 0.0; duration: Style.duration(180); easing.type: Easing.OutQuad
+      to: 0.0; duration: Style.duration(150); easing.type: Easing.OutCubic
     }
     ScriptAction {
       script: {
@@ -963,7 +977,7 @@ Panel {
     }
     PropertyAnimation {
       target: hero; property: "metaOpacity"
-      to: 1.0; duration: Style.duration(260); easing.type: Easing.InQuad
+      to: 1.0; duration: Style.duration(200); easing.type: Easing.OutCubic
     }
   }
 
@@ -2013,7 +2027,8 @@ Panel {
     property real fetchedAt: 0
     readonly property var scoped: window && window.scoped ? window.scoped : []
     readonly property bool info: !!window && window.percent < 0
-    readonly property bool alarming: !!window && window.percent >= root.alarmThreshold
+    readonly property bool alarming: !!window && window.alarm !== false && window.percent >= root.alarmThreshold
+    readonly property bool urgentRow: !!window && window.urgent === true
     readonly property real resetMs: root.resetMsFor(window)
     implicitHeight: Math.max(compactTitle.implicitHeight, compactValue.implicitHeight)
 
@@ -2031,6 +2046,7 @@ Panel {
             ? Commons.I18n.t("agents.windowUsedResets").arg(windowName).arg(used).arg(root.formatDuration(compact.resetMs))
             : Commons.I18n.t("agents.windowUsed").arg(windowName).arg(used))
         }
+        if (compact.window && compact.window.detail) lines.push(compact.window.detail)
         if (compact.stale)
           lines.push(compact.fetchedAt > 0 && root.nowMs - compact.fetchedAt > 60000
             ? Commons.I18n.t("agents.lastUpdatedAgo").arg(root.formatDuration(root.nowMs - compact.fetchedAt))
@@ -2044,10 +2060,10 @@ Panel {
     Text {
       id: compactTitle
       textFormat: Text.PlainText
-      width: parent.width * 0.3
+      width: compact.info ? parent.width - compactValue.width - Style.space(12) : parent.width * 0.3
       anchors.verticalCenter: parent.verticalCenter
       text: compact.window ? root.windowDisplayTitle(compact.window.title) : ""
-      color: root.foreground
+      color: compact.urgentRow ? root.urgent : root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       elide: Text.ElideRight
@@ -2077,13 +2093,14 @@ Panel {
     // exact percentage is in the row's tooltip.
     Text {
       id: compactValue
-      width: Math.ceil(compactValueMetrics.advanceWidth)
+      width: Math.max(Math.ceil(compactValueMetrics.advanceWidth), Math.ceil(implicitWidth))
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       horizontalAlignment: Text.AlignRight
-      text: compact.resetMs > 0 ? root.formatDuration(compact.resetMs) : ""
-      color: root.dim
+      text: compact.window && compact.window.value ? compact.window.value
+        : compact.resetMs > 0 ? root.formatDuration(compact.resetMs) : ""
+      color: compact.urgentRow ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
     }

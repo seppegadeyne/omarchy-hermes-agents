@@ -44,6 +44,36 @@ appears there, whoever wrote it. This repo adds two pieces on top of that:
 | --- | --- | --- |
 | Claude (`claude-cli`) | `billing_provider LIKE 'claude-subscription%'` | `api.anthropic.com/api/oauth/usage` with the claude CLI's own token |
 | ChatGPT | `billing_provider in ('openai-codex','auto')` + `chatgpt.com` base URL | `chatgpt.com/backend-api/wham/usage` with Hermes-stored tokens |
+| Hermes (`hermes-overview`) | every usage row in every state.db (all providers) | none: rows are computed (see below) |
+| Local models (`local-live`) | rows whose base URL is loopback/private/LAN | live probes: `/v1/models` per endpoint, `nvidia-smi` |
+
+### Hermes and Local models tabs (`collector/overview.py`)
+
+Both replace the stock `hermes` / `local` collectors (disabled in the bar
+config). Stock `hermes` only counted Nous Portal traffic (empty here) and
+stock `local` counted the claude CLI's `haiku`/`opus`/`sonnet` aliases as
+local models (a double count with the Claude tab). Every row is a `limits[]`
+entry, so no Panel layout beyond the row patches below was needed.
+
+- **Hermes** (orchestrator view): sessions + prompts today across all
+  profiles and providers (tooltip: split by source), tokens today (tooltip:
+  per route), API value today at API prices (`estimated_cost_usd`; tooltip:
+  7 days), gateway state from `gateway_state.json` (pid liveness, platform
+  connections, active agents), cron runs today from every profile's
+  `cron/executions.db` + failing jobs from `jobs.json` (red when anything
+  failed), and a per-profile token split when more than one profile worked
+  today. The record sets `hasPromptStats/hasLocalStats: false` and no
+  top-level token stats: those tokens already count under Claude/ChatGPT/
+  local, and the panel header sums top-level stats across tabs.
+- **Local models**: one row per local OpenAI-compatible endpoint that
+  answers (every self-hosted `base_url` in all profile `config.yaml`s plus
+  ollama/LM Studio/tabby defaults; 0.6s probe), with tok/s when llama.cpp
+  exposes `/metrics`; VRAM and GPU power meters (never alarm); GPU energy
+  today, integrated across collector runs (sidecar
+  `agents/local-live-energy.json`, gaps > 20 min skipped, price from
+  `~/.config/omarchy/agents/local-live.json` `{"eurPerKwh": 0.30}`); and the
+  fast-tier hit rate: subagent sessions over the last 7 days on a local
+  model vs on haiku.
 
 Mapping is by billing provider / base URL, so anything routed through Hermes
 (its profiles, coding plans, pooled keys) is counted per provider regardless
@@ -151,6 +181,10 @@ Deliberate safety rules learned the hard way (documented inline):
   is `claude-cli` (NOT `claude`) so the stock collector, when enabled,
   never races this one writing `usage/claude.json`; the stale stock
   record was removed and `claude` stays disabled in the bar config.
+- **Never count the claude CLI aliases as local.** `haiku`/`opus`/`sonnet`
+  rows bill to `process://claude-subscription...`; only http(s) base URLs on
+  loopback/private/LAN hosts are local. Orchestrator tabs (Hermes) must keep
+  their tokens out of the top-level stats or the header double counts.
 - **Transient network failures never blank the panel.** A limits fetch that
   fails on DNS/connection/timeout gets one retry after 5s (covers the timer
   run racing system DNS at boot); if it still fails, the last good limits
@@ -169,9 +203,11 @@ Deliberate safety rules learned the hard way (documented inline):
 ## Install
 
 ```bash
-# 1. Collector
+# 1. Collector (+ its overview module)
 cp collector/hermes-usage-collector ~/.local/bin/
 chmod +x ~/.local/bin/hermes-usage-collector
+mkdir -p ~/.local/lib/hermes-usage-collector
+cp collector/overview.py ~/.local/lib/hermes-usage-collector/
 
 # 2. systemd user timer (every 5 minutes)
 cp systemd/hermes-usage-collector.{service,timer} ~/.config/systemd/user/
@@ -193,7 +229,8 @@ Verify:
 
 ```bash
 systemctl --user status hermes-usage-collector.timer
-ls ~/.local/state/omarchy/agents/usage/   # claude-cli.json, chatgpt.json
+ls ~/.local/state/omarchy/agents/usage/   # claude-cli, chatgpt, hermes-overview, local-live
+python3 tests/test_overview.py && python3 tests/test_resilience.py
 journalctl --user -u hermes-usage-collector.service -n 20
 ```
 
@@ -241,7 +278,7 @@ omarchy-restart-shell   # hot-reload can keep serving the old document
 ```
 
 A patch that no longer matches aborts the port rather than writing a
-half-patched widget. Current patch set (stock r7052, 2026-10-19):
+half-patched widget. Current patch set (re-ported onto the stock update of 2026-10-26):
 
 - **IPC target** `seppe.agents`, so `omarchy-shell seppe.agents refresh`
   reaches the clone and not a stock instance.
@@ -251,16 +288,23 @@ half-patched widget. Current patch set (stock r7052, 2026-10-19):
 - **429 handling** (collector): probes are reused for 3 min (`--force` skips that), a 429 starts a cooldown of max(Retry-After, 10 min) during which the endpoint is not touched at all, and the last good limits stay visible (marked stale, up to 12h) instead of a red banner.
 - **Info rows**: a limit with `percent: -1` (ChatGPT credits) renders as a
   label without meter and never drives the alarm.
+- **Row extras**: a limit entry may carry `value` (short right-aligned text
+  instead of the reset countdown), `detail` (extra tooltip lines), `urgent`
+  (row in the alarm color) and `alarm: false` (a full meter, e.g. VRAM,
+  never turns the bar icon red). Info rows use the full width for the title.
 - **Pool-aware alarm**: the bar icon follows the roomiest key pool (title
   prefix before "·") and only turns red when every pool is at 90%.
 - **Launch action** (right-click) runs the classic Hermes CLI (`hermes --yolo`), not the TUI.
 - **No hero buttons and no "Make something cool" tiles**: hidden and removed from the keyboard walk.
 - **Panel width** 480 instead of 380.
-- **SVG marks** for chatgpt and claude-cli in `assets/`.
+- **SVG marks** for chatgpt and claude-cli in `assets/`; the port copies
+  stock `hermes` -> `hermes-overview` and `ollama` -> `local-live`.
+- **Hermes collector ids** run on panel refresh: claude-cli, chatgpt,
+  hermes-overview, local-live.
 
 Tab order is no longer patched: stock now supports drag/keyboard reordering
 and persists it in `~/.local/state/omarchy/agents/order.json`
-(set to `["claude-cli","chatgpt"]`). Model names use stock's friendly names.
+(set to `["claude-cli","chatgpt","hermes-overview","local-live"]`). Model names use stock's friendly names.
 
 Full panel documentation: [plugin/PANEL.md](plugin/PANEL.md).
 

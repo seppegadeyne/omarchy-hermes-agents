@@ -175,7 +175,7 @@ Item {
   // Hermes-managed providers (claude-cli, chatgpt) come from
   // hermes-usage-collector, which the stock orchestrator never runs. It
   // speaks the same flags, so panel refreshes and the 30s retry reach it.
-  readonly property var hermesProviderIds: ["claude-cli", "chatgpt"]
+  readonly property var hermesProviderIds: ["claude-cli", "chatgpt", "hermes-overview", "local-live"]
   readonly property string hermesCollectorBin: root.home !== "" ? root.home + "/.local/bin/hermes-usage-collector" : ""
 
   Process {
