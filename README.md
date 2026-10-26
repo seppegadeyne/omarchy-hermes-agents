@@ -280,7 +280,20 @@ omarchy-restart-shell   # hot-reload can keep serving the old document
 ```
 
 A patch that no longer matches aborts the port rather than writing a
-half-patched widget. Current patch set (re-ported onto the stock update of 2026-10-26):
+half-patched widget.
+
+The clone is never overwritten by an Omarchy update (stock lives in
+/usr/share/omarchy, the clone in ~/.config/omarchy/plugins). To still notice
+stock improvements, `hooks/agents-stock-check` runs as an Omarchy
+`post-update` and `post-boot` hook (install both with
+`omarchy hook install post-update|post-boot hooks/agents-stock-check`). It
+calls `scripts/check_stock_update.py`, which fingerprints the stock plugin
+and, once per new stock version, dry-runs the port in a temp dir and sends a
+desktop notification: "update beschikbaar" (port applies and differs; take
+it over with `scripts/apply_stock_port.sh`, which backs up the clone,
+installs, mirrors into plugin/ and restarts the shell) or "update past niet"
+(names the failing patch). In sync or unchanged = silent. State:
+`~/.local/state/omarchy/agents/stock-port-state.json`. Current patch set (re-ported onto the stock update of 2026-10-26):
 
 - **IPC target** `seppe.agents`, so `omarchy-shell seppe.agents refresh`
   reaches the clone and not a stock instance.
