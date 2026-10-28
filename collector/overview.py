@@ -355,7 +355,7 @@ def collect_overview(rows, unreadable):
         per_profile[r["profile"]] = per_profile.get(r["profile"], 0) + row_total(r)
     if len(per_profile) > 1 or (per_profile and "default" not in per_profile):
         for name, n in sorted(per_profile.items(), key=lambda kv: -kv[1])[:5]:
-            limits.append(meter(f"Profile {name}", n / tokens if tokens else 0, fmt_tokens(n),
+            limits.append(meter(name, n / tokens if tokens else 0, fmt_tokens(n),
                                 f"{n:,} tokens today in profile {name}"))
 
     rec["limits"] = limits

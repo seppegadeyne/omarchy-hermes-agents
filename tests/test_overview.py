@@ -47,7 +47,7 @@ def test_overview_keeps_tokens_out_of_header():
     rec = o.collect_overview(rows, [])
     assert rec["hasPromptStats"] is False and rec["todayTotalTokens"] == 0
     titles = [r["title"] for r in rec["limits"]]
-    assert "API value today" in titles and "Profile voltti" in titles
+    assert "API value today" in titles and "voltti" in titles
     for r in rec["limits"]:
         assert r["percent"] == -1 or r.get("alarm") is False, r
 
