@@ -56,6 +56,9 @@ PROVIDERS = [
     {
         "id": "chatgpt",
         "name": "ChatGPT",
+        # Removed from the bar on Seppe's request (2026-11-01); flip to
+        # True to bring the tab back.
+        "enabled": False,
         "tierLabel": "Subscription",
         "scope": "machine",
         # ChatGPT usage via Hermes is stored under openai-codex or auto,
@@ -985,7 +988,7 @@ def main():
         for meta in PROVIDERS:
             if only_ids and meta["id"] not in only_ids:
                 continue
-            if meta["id"] in excluded:
+            if meta["id"] in excluded or not meta.get("enabled", True):
                 continue
             if limits_only:
                 _refresh_limits_only(meta, auth)
