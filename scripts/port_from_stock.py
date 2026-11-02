@@ -26,6 +26,10 @@ def sub(text: str, old: str, new: str, label: str) -> str:
 
 
 def patch_panel(t: str) -> str:
+    # Stock reaches a sibling stock plugin by relative path; from the clone
+    # that resolves into ~/.config, so point it at the packaged file.
+    t = sub(t, 'import "../panels/elsewhen/Model.js" as Reorder\n',
+            'import "/usr/share/omarchy/shell/plugins/panels/elsewhen/Model.js" as Reorder\n', "reorder-import")
     t = sub(t, '  ipcTarget: "omarchy.agents"\n',
             '  // Own IPC target: a stock omarchy.agents instance would otherwise\n'
             '  // register first and swallow refresh calls meant for this clone.\n'
@@ -44,15 +48,16 @@ def patch_panel(t: str) -> str:
 
     # No hero buttons (add subscription / start agent) and no "Make something
     # cool" starter tiles: drop them from the keyboard walk and hide them.
-    t = sub(t, '    if (addButtonShown) hero.push({ kind: "add", index: 0 })\n'
-               '    if (addStage === "") hero.push({ kind: "launch", index: 0 })\n',
+    t = sub(t, '    if (addButtonShown) hero.push({ kind: "add", index: 0 })\n',
             '', "keys-hero")
     t = sub(t, '      if (!blankSlate) {\n'
                '        var tiles = []\n',
             '      if (false) {\n'
                '        var tiles = []\n', "keys-starter")
-    t = sub(t, '                visible: root.addStage === "" || root.addButtonShown\n',
-            '                visible: false\n', "hero-buttons")
+    t = sub(t, '                spacing: Style.space(6)\n'
+               '                visible: root.addButtonShown\n',
+            '                spacing: Style.space(6)\n'
+               '                visible: false\n', "hero-buttons")
     t = sub(t, '          PanelSeparator {\n'
                '            visible: root.addStage === "" && !root.blankSlate\n',
             '          PanelSeparator {\n'
