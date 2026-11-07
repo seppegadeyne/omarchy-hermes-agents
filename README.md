@@ -334,3 +334,5 @@ Full panel documentation: [plugin/PANEL.md](plugin/PANEL.md).
 
 - Collector and systemd units: [MIT](LICENSE), © Seppe Gadeyne.
 - `plugin/` derives from Omarchy (`omarchy.agents`), MIT © Omarchy contributors.
+
+Quality floor and ratchets: see [CONSTRAINTS.md](CONSTRAINTS.md).
